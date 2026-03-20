@@ -97,4 +97,3 @@ python task1.py.txt
 
 ## Notes
 - Some modules are snapshot exports (`.txt`) and may need restoring for direct IDE builds.
-- Detailed personal contribution doc: `README_my_contribution.md`.
