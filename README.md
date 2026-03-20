@@ -65,35 +65,6 @@ A distributed robotics stack:
 - Recovery: Android reconnect + process restart
 - Task profiles: manual (`task0`), mission (`task1`), image-decision mission (`task2`)
 
-## Setup (Minimal)
-
-### Algo/API
-```bash
-cd algo
-npm install
-npm run dev
-pip install -r requirements.txt
-python main.txt
-```
-
-### RPi
-```bash
-cd rpi
-pip install -r requirements.txt
-python task1.py.txt
-# or task2.py.txt
-```
-
-### STM32
-1. Open `stm_task_1` in STM32CubeIDE.
-2. Build + flash.
-3. Verify UART ACK behavior.
-
-## Key Config Files
-- `rpi/settings.py.txt` serial + API host/port
-- `rpi/consts.py.txt` image label map
-- `stm_task_1/Inc/task_priorities.h` RTOS cadence/priorities
-- `stm_task_1/Inc/command_parser.h` command format
-
 ## Notes
 - Some modules are snapshot exports (`.txt`) and may need restoring for direct IDE builds.
+- Setup is inconsistent and broken at the moment. Please wait while we clear the repository.
