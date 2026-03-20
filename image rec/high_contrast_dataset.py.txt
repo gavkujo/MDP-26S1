@@ -1,0 +1,58 @@
+import cv2
+import os
+from glob import glob
+import shutil
+
+# Source (original) and destination (output) dataset folders
+SRC_ROOT = "/home/users/ntu/leey0227/scratch/mdp_v2/task2_images"
+DST_ROOT = "tas2_images_highcontrast_grayscale"
+
+splits = ["train", "val", "test"]
+image_exts = ["*.png", "*.jpg", "*.jpeg"]
+
+for split in splits:
+    src_img_dir = os.path.join(SRC_ROOT, split, "images")
+    src_lbl_dir = os.path.join(SRC_ROOT, split, "labels")
+    dst_img_dir = os.path.join(DST_ROOT, split, "images")
+    dst_lbl_dir = os.path.join(DST_ROOT, split, "labels")
+    
+    os.makedirs(dst_img_dir, exist_ok=True)
+    os.makedirs(dst_lbl_dir, exist_ok=True)
+    
+    # 1️⃣ Copy all label files as-is
+    for lbl_file in glob(os.path.join(src_lbl_dir, "*.txt")):
+        shutil.copy(lbl_file, dst_lbl_dir)
+    
+    # 2️⃣ Process and save all image files
+    img_paths = []
+    for ext in image_exts:
+        img_paths.extend(glob(os.path.join(src_img_dir, ext)))
+    
+    print(f"\n📂 Processing {split}: {len(img_paths)} images")
+    
+    for i, img_path in enumerate(img_paths):
+        img = cv2.imread(img_path)
+        if img is None:
+            print(f"⚠️ Failed to read {img_path}")
+            continue
+        
+        # Convert to grayscale
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        
+        # Enhance contrast
+        gray_eq = cv2.equalizeHist(gray)
+        
+        # Add edge emphasis (Laplacian)
+        edges = cv2.Laplacian(gray_eq, cv2.CV_8U)
+        combined = cv2.addWeighted(gray_eq, 0.8, edges, 0.2, 0)
+        
+        # Save as PNG (grayscale)
+        out_name = os.path.splitext(os.path.basename(img_path))[0] + ".png"
+        out_path = os.path.join(dst_img_dir, out_name)
+        cv2.imwrite(out_path, combined)
+        
+        if i % 100 == 0:
+            print(f"Processed {i+1}/{len(img_paths)} images")
+
+print("\n✅ All splits processed successfully!")
+print(f"➡️ New dataset saved under: {DST_ROOT}")

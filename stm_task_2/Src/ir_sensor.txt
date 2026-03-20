@@ -1,0 +1,90 @@
+/*
+ * IR_Sensor.c
+ *
+ *  Created on: Oct 1, 2025
+ *      Author: TREVYEN YEZDI
+ */
+
+#include "ir_sensor.h"
+#include "main.h"
+#include <stdio.h>     // for sprintf
+#include "oled.h"      // for OLED_ShowString, OLED_Refresh_Gram
+extern ADC_HandleTypeDef hadc1;
+extern ADC_HandleTypeDef hadc2;
+
+#define IR_FILTER_LEN 5  // adjust for more or less smoothing
+
+// ------- Global IR Distances ------------
+volatile float g_irLeftDist  = 0.0f;
+volatile float g_irRightDist = 0.0f;
+
+// --- Filter buffers ---
+static uint16_t ir1_buf[IR_FILTER_LEN] = {0};
+static uint16_t ir2_buf[IR_FILTER_LEN] = {0};
+static int ir1_idx = 0, ir2_idx = 0;
+
+// --- Raw read functions ---
+uint16_t IR1_ReadRaw(void) {
+    HAL_ADC_Start(&hadc2);
+    HAL_ADC_PollForConversion(&hadc2, 10);
+    uint16_t raw = HAL_ADC_GetValue(&hadc2);
+    HAL_ADC_Stop(&hadc2);
+
+    // Add to filter buffer
+    ir1_buf[ir1_idx] = raw;
+    ir1_idx = (ir1_idx + 1) % IR_FILTER_LEN;
+
+    // Compute average
+    uint32_t sum = 0;
+    for (int i = 0; i < IR_FILTER_LEN; i++) sum += ir1_buf[i];
+    return (uint16_t)(sum / IR_FILTER_LEN);
+}
+
+uint16_t IR2_ReadRaw(void) {
+    HAL_ADC_Start(&hadc1);
+    HAL_ADC_PollForConversion(&hadc1, 10);
+    uint16_t raw = HAL_ADC_GetValue(&hadc1);
+    HAL_ADC_Stop(&hadc1);
+
+    // Add to filter buffer
+    ir2_buf[ir2_idx] = raw;
+    ir2_idx = (ir2_idx + 1) % IR_FILTER_LEN;
+
+    // Compute average
+    uint32_t sum = 0;
+    for (int i = 0; i < IR_FILTER_LEN; i++) sum += ir2_buf[i];
+    return (uint16_t)(sum / IR_FILTER_LEN);
+}
+
+// --- Distance calculation (still using formula, now with filtered raw) ---
+float IR_VtoCm(float v)
+{
+    if (v < 0.13f) return -1.0f;     // avoid blow-up below offset
+    float d = 21.714f / (v - 0.1286f);
+    if (d < 10.0f || d > 80.0f) return -1.0f;   // outside sensor’s rated range
+    return d;
+}
+
+float IR1_GetDistanceCm(void) {
+    uint16_t raw = IR1_ReadRaw();
+    float v = (3.3f * raw) / 4095.0f;
+    return IR_VtoCm(v);
+}
+
+float IR2_GetDistanceCm(void) {
+    uint16_t raw = IR2_ReadRaw();
+    float v = (3.3f * raw) / 4095.0f;
+    return IR_VtoCm(v);
+}
+
+// --- OLED display ---
+void IR_Display(float distanceCm, uint16_t x, uint16_t y) {
+    char buff[32];
+    if (distanceCm > 0.0f) {
+        sprintf(buff, "IR: %.1f cm", distanceCm);
+    } else {
+        sprintf(buff, "IR: No Obj");
+    }
+    OLED_ShowString(x, y, (uint8_t*)buff);
+    OLED_Refresh_Gram();
+}

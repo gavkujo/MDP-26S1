@@ -1,0 +1,29 @@
+/* servo.h */
+
+#ifndef SERVO_H_
+#define SERVO_H_
+
+#include "stm32f4xx_hal.h"
+
+// Adjust these as needed for your servo
+#define SERVO_CENTER 170
+#define SERVO_LEFT   118
+#define SERVO_RIGHT  250
+
+// Slight nudges (pick values a bit off center)
+#define SERVO_SLIGHT_LEFT_PWM   160   // ~slight left
+#define SERVO_SLIGHT_RIGHT_PWM  175   // ~slight right
+
+// Init/start PWM for servo
+void Servo_Init(void);
+
+// Positioning helpers
+void Servo_Center(void);
+void Servo_Left(void);
+void Servo_Right(void);
+void Servo_SlightLeft(void);
+void Servo_SlightRight(void);
+
+void Servo_SetRaw(uint16_t value);
+
+#endif /* SERVO_H_ */

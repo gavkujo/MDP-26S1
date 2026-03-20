@@ -1,0 +1,35 @@
+from ultralytics import YOLO
+
+# Path to your YOLOv8 model (can be yolov8n.pt, yolov8s.pt, etc.)
+# MODEL_PATH = 'yolov8n.pt'
+MODEL_PATH = '/home/users/ntu/leey0227/scratch/mdp_v2/runs/detect/v8_roboflow_grayscale_3/weights/best.pt'
+# MODEL_PATH = 'best_recolored_glare.pt'
+# MODEL_PATH = '/home/users/ntu/leey0227/scratch/mdp_v2/runs/detect/v8_original_8/weights/best.pt'
+# MODEL_PATH = '/home/users/ntu/leey0227/scratch/mdp_v2/runs/detect/v8_original_11/weights/best.pt'
+
+# This words pretty good
+# MODEL_PATH = '/home/users/ntu/leey0227/scratch/mdp_v2/runs/detect/v8_given_data_no_augment_6/weights/best.pt'
+
+# Initialize YOLO model
+model = YOLO(MODEL_PATH)
+
+# # Train the model
+# model.train(
+#     data='PretrainingDataset_original/data.yaml',  # Path to your dataset YAML
+#     epochs=25,              # Adjust as needed
+#     imgsz=640,              # Image size
+#     batch=16,               # Batch size
+#     name='v8_original_'    # Folder to save weights/results
+# )
+
+# given_images/data.yaml
+# colored_data_2_processed/data.yaml
+# Train the model
+model.train(
+    data='tas2_images_highcontrast_grayscale/data.yaml',  # Path to your dataset YAML
+    epochs=50,              # Adjust as needed
+    imgsz=640,              # Image size
+    batch=16,               # Batch size
+    name='v8_task2_grayscale_',    # Folder to save weights/results
+    fliplr=0.0,
+)

@@ -1,0 +1,354 @@
+/*
+ * shared_data.c
+ *
+ *  Created on: Sep 25, 2025
+ *      Author: MDP Team
+ */
+
+#include "shared_data.h"
+#include "main.h"
+#include "encoder.h"
+#include <string.h>
+
+#define LEFT_TICK_SIGN   (+1)
+#define RIGHT_TICK_SIGN  (-1)   // flip to +1 or -1 to match your hardware
+
+
+// Global shared data instance
+SharedSensorData_t g_sensor_data;
+
+// Mutex for protecting shared sensor data
+osMutexId_t xSensorDataMutex;
+
+/**
+ * @brief Initialize shared sensor data structure
+ */
+MotionGoal_t g_motion_goal = {0};
+static bool s_encoder_initialized = false;
+
+
+void SharedData_Init(void) {
+    uint32_t current_time;
+    osMutexAttr_t mutex_attr;
+    
+    // Initialize mutex attributes
+    mutex_attr.name = "SensorDataMutex";
+    mutex_attr.attr_bits = osMutexRecursive;
+    mutex_attr.cb_mem = NULL;
+    mutex_attr.cb_size = 0U;
+    
+    // Initialize all fields to safe defaults
+    memset(&g_sensor_data, 0, sizeof(SharedSensorData_t));
+    
+    // Set initial values
+    g_sensor_data.front_distance_cm = 999.0f;  // Far distance
+    g_sensor_data.left_distance_cm = 999.0f;
+    g_sensor_data.right_distance_cm = 999.0f;
+    g_sensor_data.obstacle_detected = false;
+    g_sensor_data.left_wall_detected = false;
+    g_sensor_data.right_wall_detected = false;
+    g_sensor_data.emergency_stop_active = false;
+    g_sensor_data.imu_ready = false;
+    g_sensor_data.imu_calibrated = false;
+    g_sensor_data.yaw_angle_deg = 0.0f;
+    g_sensor_data.gyro_z_dps = 0.0f;
+    
+    // Initialize timestamps
+    current_time = HAL_GetTick();
+    g_sensor_data.ultrasonic_last_update_ms = current_time;
+    g_sensor_data.ir_last_update_ms = current_time;
+    g_sensor_data.encoder_last_update_ms = current_time;
+    g_sensor_data.imu_last_update_ms = current_time;
+    g_sensor_data.system_time_ms = current_time;
+    
+    // Detection defaults
+    g_sensor_data.detection_code[0] = '0';
+    g_sensor_data.detection_code[1] = '0';
+    g_sensor_data.detection_code[2] = '\0';
+    g_sensor_data.detection_last_update_ms = current_time;
+
+    // Reset motion goal state
+    g_motion_goal = (MotionGoal_t){0};
+    s_encoder_initialized = false;
+
+    // Create mutex for sensor data protection
+    xSensorDataMutex = osMutexNew(&mutex_attr);
+}
+
+/**
+ * @brief Update ultrasonic sensor data (called from ultrasonic timer)
+ */
+void SharedData_UpdateUltrasonic(float distance_cm) {
+    if (osMutexAcquire(xSensorDataMutex, 10) == osOK) {
+        g_sensor_data.front_distance_cm = distance_cm;
+        g_sensor_data.obstacle_detected = (distance_cm < OBSTACLE_THRESHOLD_CM);
+        g_sensor_data.ultrasonic_last_update_ms = HAL_GetTick();
+        g_sensor_data.system_time_ms = HAL_GetTick();
+        
+        osMutexRelease(xSensorDataMutex);
+    }
+}
+
+/**
+ * @brief Update encoder data (called from encoder timer)
+ */
+//void SharedData_UpdateEncoders(int32_t left_ticks, int32_t right_ticks) {
+//    float left_distance_delta;
+//    float right_distance_delta;
+//    float distance_delta;
+//    uint32_t current_time;
+//    uint32_t time_delta;
+//    const float TICKS_PER_CM = (float)TICKS_PER_WHEEL_REV / WHEEL_CIRCUMFERENCE_CM;
+//
+//    if (osMutexAcquire(xSensorDataMutex, osWaitForever) == osOK) {
+//        if (!s_encoder_initialized) {
+//            g_sensor_data.left_encoder_ticks = left_ticks;
+//            g_sensor_data.right_encoder_ticks = right_ticks;
+//            g_sensor_data.left_encoder_delta = 0;
+//            g_sensor_data.right_encoder_delta = 0;
+//            g_sensor_data.current_speed_left_cms = 0.0f;
+//            g_sensor_data.current_speed_right_cms = 0.0f;
+//            g_sensor_data.encoder_last_update_ms = HAL_GetTick();
+//            g_sensor_data.system_time_ms = g_sensor_data.encoder_last_update_ms;
+//            s_encoder_initialized = true;
+//            osMutexRelease(xSensorDataMutex);
+//            return;
+//        }
+//
+//        int32_t raw_left_delta = left_ticks - g_sensor_data.left_encoder_ticks;
+//        int32_t raw_right_delta = right_ticks - g_sensor_data.right_encoder_ticks;
+//
+//        if (raw_left_delta > (int32_t)(UINT16_MAX / 2)) {
+//            raw_left_delta -= (int32_t)(UINT16_MAX + 1U);
+//        } else if (raw_left_delta < -(int32_t)(UINT16_MAX / 2)) {
+//            raw_left_delta += (int32_t)(UINT16_MAX + 1U);
+//        }
+//
+//        if (raw_right_delta > (int32_t)(UINT16_MAX / 2)) {
+//            raw_right_delta -= (int32_t)(UINT16_MAX + 1U);
+//        } else if (raw_right_delta < -(int32_t)(UINT16_MAX / 2)) {
+//            raw_right_delta += (int32_t)(UINT16_MAX + 1U);
+//        }
+//
+//        // Calculate deltas
+//        g_sensor_data.left_encoder_delta = raw_left_delta;
+//        g_sensor_data.right_encoder_delta = raw_right_delta;
+//
+//        // Update absolute values
+//        g_sensor_data.left_encoder_ticks = left_ticks;
+//        g_sensor_data.right_encoder_ticks = right_ticks;
+//
+//        // Calculate distance traveled (assuming wheel circumference and encoder resolution)
+//        // This is a simplified calculation - adjust based on your robot's specifications
+//        left_distance_delta = g_sensor_data.left_encoder_delta / TICKS_PER_CM;
+//        right_distance_delta = g_sensor_data.right_encoder_delta / TICKS_PER_CM;
+//        distance_delta = (left_distance_delta + right_distance_delta) / 2.0f;
+//
+//        g_sensor_data.distance_traveled_cm += distance_delta;
+//
+//        // Calculate speeds (cm/s) - based on timer period
+//        current_time = HAL_GetTick();
+//        time_delta = current_time - g_sensor_data.encoder_last_update_ms;
+//        if (time_delta > 0) {
+//            g_sensor_data.current_speed_left_cms = (left_distance_delta * 1000.0f) / time_delta;
+//            g_sensor_data.current_speed_right_cms = (right_distance_delta * 1000.0f) / time_delta;
+//        }
+//
+//        g_sensor_data.encoder_last_update_ms = current_time;
+//        g_sensor_data.system_time_ms = current_time;
+//
+//        osMutexRelease(xSensorDataMutex);
+//    }
+//}
+
+void SharedData_UpdateEncoders(int32_t left_ticks, int32_t right_ticks) {
+    uint32_t current_time;
+    uint32_t time_delta;
+
+    // use a single, consistent factor
+
+    if (osMutexAcquire(xSensorDataMutex, osWaitForever) == osOK) {
+        if (!s_encoder_initialized) {
+            g_sensor_data.left_encoder_ticks   = left_ticks;
+            g_sensor_data.right_encoder_ticks  = right_ticks;
+            g_sensor_data.left_encoder_delta   = 0;
+            g_sensor_data.right_encoder_delta  = 0;
+            g_sensor_data.current_speed_left_cms  = 0.0f;
+            g_sensor_data.current_speed_right_cms = 0.0f;
+            g_sensor_data.distance_traveled_cm    = 0.0f;   // start at zero
+            g_sensor_data.encoder_last_update_ms  = HAL_GetTick();
+            g_sensor_data.system_time_ms          = g_sensor_data.encoder_last_update_ms;
+            s_encoder_initialized = true;
+            osMutexRelease(xSensorDataMutex);
+            return;
+        }
+
+        // raw deltas (unsigned wrap corrected to signed)
+        int32_t raw_left_delta  = left_ticks  - g_sensor_data.left_encoder_ticks;
+        int32_t raw_right_delta = right_ticks - g_sensor_data.right_encoder_ticks;
+
+        if (raw_left_delta >  (int32_t)(UINT16_MAX / 2))  raw_left_delta  -= (int32_t)(UINT16_MAX + 1U);
+        if (raw_left_delta < -(int32_t)(UINT16_MAX / 2))  raw_left_delta  += (int32_t)(UINT16_MAX + 1U);
+
+        if (raw_right_delta >  (int32_t)(UINT16_MAX / 2)) raw_right_delta -= (int32_t)(UINT16_MAX + 1U);
+        if (raw_right_delta < -(int32_t)(UINT16_MAX / 2)) raw_right_delta += (int32_t)(UINT16_MAX + 1U);
+
+        // normalize signs so forward is + for BOTH wheels
+        int32_t dL = raw_left_delta  * LEFT_TICK_SIGN;
+        int32_t dR = raw_right_delta * RIGHT_TICK_SIGN;
+
+        // stash per-wheel deltas (ticks) if you want to view them elsewhere
+        g_sensor_data.left_encoder_delta  = dL;
+        g_sensor_data.right_encoder_delta = dR;
+
+        // update absolute tick snapshots for next call
+        g_sensor_data.left_encoder_ticks  = left_ticks;
+        g_sensor_data.right_encoder_ticks = right_ticks;
+
+        // convert to distance this interval (cm)
+        float left_cm  = (float)dL * CM_PER_TICK;
+        float right_cm = (float)dR * CM_PER_TICK;
+
+        // forward distance increment = average of both wheels
+        g_sensor_data.distance_traveled_cm += 0.5f * (left_cm + right_cm);
+
+        // optional: speeds from this interval (cm/s)
+        current_time = HAL_GetTick();
+        time_delta   = current_time - g_sensor_data.encoder_last_update_ms;
+        if (time_delta > 0U) {
+            float dt_s = (float)time_delta * 0.001f;
+            g_sensor_data.current_speed_left_cms  = left_cm  / dt_s;
+            g_sensor_data.current_speed_right_cms = right_cm / dt_s;
+        }
+
+        g_sensor_data.encoder_last_update_ms = current_time;
+        g_sensor_data.system_time_ms         = current_time;
+
+        osMutexRelease(xSensorDataMutex);
+    }
+}
+
+void SharedData_UpdateDetection(const char *detection_code) {
+    if (!detection_code) {
+        return;
+    }
+
+    if (osMutexAcquire(xSensorDataMutex, 10) == osOK) {
+        g_sensor_data.detection_code[0] = detection_code[0];
+        g_sensor_data.detection_code[1] = detection_code[1];
+        g_sensor_data.detection_code[2] = '\0';
+        g_sensor_data.detection_last_update_ms = HAL_GetTick();
+        g_sensor_data.system_time_ms = g_sensor_data.detection_last_update_ms;
+        osMutexRelease(xSensorDataMutex);
+    }
+}
+
+/**
+ * @brief Update IMU data (called from IMU timer)
+ */
+void SharedData_UpdateIMU(float yaw_deg, float gyro_z) {
+    if (osMutexAcquire(xSensorDataMutex, 10) == osOK) {
+        g_sensor_data.yaw_angle_deg = yaw_deg;
+        g_sensor_data.gyro_z_dps = gyro_z;
+        g_sensor_data.imu_ready = true;
+        g_sensor_data.imu_last_update_ms = HAL_GetTick();
+        g_sensor_data.system_time_ms = HAL_GetTick();
+        
+        osMutexRelease(xSensorDataMutex);
+    }
+}
+
+/**
+ * @brief Update IR sensor data
+ */
+void SharedData_UpdateIR(float left_distance, float right_distance) {
+    if (osMutexAcquire(xSensorDataMutex, 10) == osOK) {
+        g_sensor_data.left_distance_cm = left_distance;
+        g_sensor_data.right_distance_cm = right_distance;
+        g_sensor_data.left_wall_detected = (left_distance < IR_SIDE_THRESHOLD_CM);
+        g_sensor_data.right_wall_detected = (right_distance < IR_SIDE_THRESHOLD_CM);
+        g_sensor_data.ir_last_update_ms = HAL_GetTick();
+        g_sensor_data.system_time_ms = HAL_GetTick();
+        
+        osMutexRelease(xSensorDataMutex);
+    }
+}
+
+/**
+ * @brief Get a safe copy of sensor data
+ */
+bool SharedData_GetSensorData(SharedSensorData_t* data_copy) {
+	//bool data_fresh = true;
+    
+    if (!data_copy) {
+        return false;
+    }
+    
+    if (osMutexAcquire(xSensorDataMutex, 50) == osOK) {
+        // Copy the entire structure
+        memcpy(data_copy, &g_sensor_data, sizeof(SharedSensorData_t));
+        
+        // Check if data is fresh
+        //data_fresh = SharedData_IsDataFresh();
+        
+        osMutexRelease(xSensorDataMutex);
+    //} else {
+        //data_fresh = false;
+        return true;
+    }
+    
+    //return data_fresh;
+    return false;
+}
+
+/**
+ * @brief Check if emergency stop should be triggered
+ */
+bool SharedData_CheckEmergencyStop(void) {
+//    bool emergency_needed = false;
+//
+//    if (osMutexAcquire(xSensorDataMutex, 10) == osOK) {
+//        // Check for obstacles or emergency conditions
+//        emergency_needed = g_sensor_data.obstacle_detected ||
+//                          g_sensor_data.emergency_stop_active ||
+//                          !SharedData_IsDataFresh();
+//
+//        osMutexRelease(xSensorDataMutex);
+//    }
+//
+//    return emergency_needed;
+	return false;
+}
+
+/**
+ * @brief Set emergency stop state
+ */
+void SharedData_SetEmergencyStop(bool active) {
+    if (osMutexAcquire(xSensorDataMutex, 10) == osOK) {
+        g_sensor_data.emergency_stop_active = active;
+        g_sensor_data.system_time_ms = HAL_GetTick();
+        
+        osMutexRelease(xSensorDataMutex);
+    }
+}
+
+/**
+ * @brief Check if sensor data is fresh (within timeout)
+ */
+bool SharedData_IsDataFresh(void) {
+    uint32_t current_time;
+    bool ultrasonic_fresh;
+    bool encoder_fresh;
+    bool imu_fresh;
+    
+    current_time = HAL_GetTick();
+    
+    // Check critical sensors (ultrasonic and encoders)
+    ultrasonic_fresh = (current_time - g_sensor_data.ultrasonic_last_update_ms) < SENSOR_DATA_TIMEOUT_MS;
+    encoder_fresh = (current_time - g_sensor_data.encoder_last_update_ms) < SENSOR_DATA_TIMEOUT_MS;
+    imu_fresh = (current_time - g_sensor_data.imu_last_update_ms) < SENSOR_DATA_TIMEOUT_MS;
+    
+    // IR sensor is not critical for now (stub implementation)
+    
+    return ultrasonic_fresh && encoder_fresh && imu_fresh;
+}

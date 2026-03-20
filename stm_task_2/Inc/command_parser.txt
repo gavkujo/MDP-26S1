@@ -1,0 +1,41 @@
+#ifndef INC_COMMAND_PARSER_H_
+#define INC_COMMAND_PARSER_H_
+
+#include <stdint.h>
+#include <stdbool.h>
+
+// Command Types
+typedef enum {
+    CMD_FORWARD,              // FWddd (000..999)
+    CMD_BACKWARD,             // BWddd (000..999)
+    CMD_STOP,                 // STOP-
+    CMD_FORWARD_INDEFINITE,   // FW---
+    CMD_BACKWARD_INDEFINITE,  // BW---
+    CMD_TURN_LEFT_90,         // FL090
+    CMD_TURN_RIGHT_90,        // FR090
+    CMD_TURN_LEFT_45,         // FL045
+    CMD_TURN_RIGHT_45,        // FR045
+    CMD_TURN_LEFT_180,        // FL180
+    CMD_TURN_RIGHT_180,       // FR180
+
+    // NEW: backward pivot turns (outer wheel in reverse)
+    CMD_TURN_LEFT_90_BACK,    // BL090
+    CMD_TURN_RIGHT_90_BACK,   // BR090
+
+    CMD_INVALID
+} CommandType_t;
+
+// Robot Command Structure
+typedef struct {
+    char detection_data[3];   // 2 digits + '\0'
+    CommandType_t cmd_type;
+    uint16_t units;           // 0..999 for FWddd/BWddd
+    bool is_indefinite;       // true for FW---/BW---
+} RobotCommand_t;
+
+// 7-character commands, e.g. "00FW090", "00FR090", "00STOP-"
+bool Command_Parse(const char* cmd_string, RobotCommand_t* parsed_cmd);
+const char* Command_GetTypeString(CommandType_t cmd_type);
+bool Command_ValidateFormat(const char* cmd_string);
+
+#endif /* INC_COMMAND_PARSER_H_ */

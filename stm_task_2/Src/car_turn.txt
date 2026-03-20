@@ -1,0 +1,912 @@
+/*
+ * car_turn.c
+ *
+ *  Created on: 18 Sep 2025
+ *      Author: Trevyen Yezdi 
+ */
+
+#include "car_turn.h"
+#include "ICM20948.h"
+#include "servo.h"
+#include "motor.h"
+#include <math.h>
+#include "encoder.h"
+#include "PID.h"
+#include "shared_data.h"
+#include "robot_state.h"
+#include "cmsis_os.h"
+#include "stm32f4xx_hal.h"
+
+extern volatile bool s_final_ultra_approach;  // defined in freertos.c
+
+
+extern I2C_HandleTypeDef hi2c2;
+extern osMessageQueueId_t xMotorQueue;
+
+static inline float wrap180(float a) {
+    while (a > 180.0f) a -= 360.0f;
+    while (a < -180.0f) a += 360.0f;
+    return a;
+}
+
+typedef struct {
+    MotorCommandType_t type;
+    uint32_t left_pwm;
+    uint32_t right_pwm;
+    uint8_t  valid;
+} MotorCommandCache_t;
+
+static MotorCommandCache_t s_last_motor_cmd = {0};
+
+static bool MotorCommand_Send(MotorCommandType_t type,
+                              uint32_t left_pwm,
+                              uint32_t right_pwm,
+                              uint32_t duration_ms)
+{
+    if (xMotorQueue == NULL) {
+        return false;
+    }
+
+    MotorCommand_t cmd = {0};
+    cmd.cmd_type = type;
+    cmd.left_pwm = left_pwm;
+    cmd.right_pwm = right_pwm;
+    cmd.duration_ms = duration_ms;
+    cmd.use_pid = false;
+    cmd.target_speed_cms = 0.0f;
+
+    return (osMessageQueuePut(xMotorQueue, &cmd, 0, 0) == osOK);
+}
+
+static bool MotorCommand_Ensure(MotorCommandType_t type,
+                                uint32_t left_pwm,
+                                uint32_t right_pwm)
+{
+    if (!s_last_motor_cmd.valid ||
+        s_last_motor_cmd.type      != type ||
+        s_last_motor_cmd.left_pwm  != left_pwm ||
+        s_last_motor_cmd.right_pwm != right_pwm) {
+        if (MotorCommand_Send(type, left_pwm, right_pwm, 0U)) {
+            s_last_motor_cmd.valid     = 1U;
+            s_last_motor_cmd.type      = type;
+            s_last_motor_cmd.left_pwm  = left_pwm;
+            s_last_motor_cmd.right_pwm = right_pwm;
+            return true;
+        }
+        return false;
+    }
+    return true;
+}
+
+static void MotorCommand_RequestBrake(void)
+{
+    if (MotorCommand_Send(MOTOR_CMD_BRAKE, 0U, 0U, 0U)) {
+        s_last_motor_cmd.valid = 0U;
+    }
+}
+
+static void MotorCommand_RequestStop(void)
+{
+    if (!s_last_motor_cmd.valid || s_last_motor_cmd.type != MOTOR_CMD_STOP) {
+        if (MotorCommand_Send(MOTOR_CMD_STOP, 0U, 0U, 0U)) {
+            s_last_motor_cmd.valid     = 1U;
+            s_last_motor_cmd.type      = MOTOR_CMD_STOP;
+            s_last_motor_cmd.left_pwm  = 0U;
+            s_last_motor_cmd.right_pwm = 0U;
+        }
+    }
+}
+
+static void MotorCommand_ResetCache(void)
+{
+    s_last_motor_cmd.valid = 0U;
+}
+
+typedef struct {
+    uint8_t pwm_posted;
+    uint8_t brake_sent;
+} DriveCtx_t;
+
+static DriveCtx_t s_forward_ctx  = {0};
+static DriveCtx_t s_backward_ctx = {0};
+
+#define SERVO_SETTLE_MS  200U
+
+void Robot_MoveStraight(float target_cm,
+                        uint32_t base_pwm_left, uint32_t base_pwm_right)
+{
+    SharedSensorData_t data;
+    (void)target_cm;
+
+    if (!g_motion_goal.active) {
+        s_forward_ctx.pwm_posted = 0U;
+        s_forward_ctx.brake_sent = 0U;
+        return;
+    }
+
+    if (!g_motion_goal.started) {
+        if (!SharedData_GetSensorData(&data)) {
+            return;
+        }
+
+        g_motion_goal.start_distance_cm = data.distance_traveled_cm;
+        g_motion_goal.start_left_ticks  = data.left_encoder_ticks;
+        g_motion_goal.start_right_ticks = data.right_encoder_ticks;
+        g_motion_goal.start_yaw_deg     = data.yaw_angle_deg;
+        g_motion_goal.started           = 1;
+        g_motion_goal.completed         = 0;
+
+        s_forward_ctx.pwm_posted = 0U;
+        s_forward_ctx.brake_sent = 0U;
+        MotorCommand_RequestStop();
+        MotorCommand_ResetCache();
+    }
+
+    if (!SharedData_GetSensorData(&data)) {
+        return;
+    }
+
+    float error_yaw = wrap180(data.yaw_angle_deg - g_motion_goal.start_yaw_deg);
+
+    if (fabsf(error_yaw) > 1.0f) {
+        if (error_yaw > 0.0f) {
+            Servo_SlightLeft();
+        } else {
+            Servo_SlightRight();
+        }
+    } else {
+        Servo_Center();
+    }
+
+    if (!s_forward_ctx.pwm_posted) {
+        if (MotorCommand_Ensure(MOTOR_CMD_FORWARD, base_pwm_left, base_pwm_right)) {
+            s_forward_ctx.pwm_posted = 1U;
+        }
+    }
+
+    float travelled = data.distance_traveled_cm - g_motion_goal.start_distance_cm;
+    if (travelled < 0.0f) {
+        travelled = 0.0f;
+    }
+
+    if (travelled >= g_motion_goal.target_distance_cm) {
+        if (!s_forward_ctx.brake_sent) {
+            MotorCommand_RequestBrake();
+            MotorCommand_RequestStop();
+            s_forward_ctx.brake_sent = 1U;
+        }
+
+        Servo_Center();
+        g_motion_goal.active             = 0;
+        g_motion_goal.started            = 0;
+        g_motion_goal.completed          = 1;
+        g_motion_goal.target_distance_cm = 0.0f;
+        current_robot_state              = ROBOT_STATE_IDLE;
+        MotorCommand_ResetCache();
+        s_forward_ctx.pwm_posted = 0U;
+        s_forward_ctx.brake_sent = 0U;
+    }
+}
+
+//void Robot_MoveStraight_NoBrake(float target_cm,
+//                        uint32_t base_pwm_left, uint32_t base_pwm_right)
+//{
+//    encoders_start_both();
+//    int64_t A_total_ticks = 0;
+//    int64_t C_total_ticks = 0;
+//
+//    // Capture initial yaw for straight reference
+//    SharedSensorData_t sd;
+//    float startYaw = 0.0f;
+//    if (SharedData_GetSensorData(&sd)) {
+//        startYaw = sd.yaw_angle_deg;
+//    }
+//    const float Kp_yaw = 30.0f;   // tune this experimentally
+//
+//    while (1) {
+//        // Snapshot encoder counters
+//        update_cnt1(&encA);
+//        update_cnt1(&encC);
+//        HAL_Delay(SAMPLE_DT_MS);
+//        update_cnt2(&encA);
+//        update_cnt2(&encC);
+//        update_diff(&encA);
+//        update_diff(&encC);
+//
+//        // Update totals (signed diffs)
+//        A_total_ticks += encA.diff;
+//        C_total_ticks += encC.diff;
+//
+//        // Compute distance travelled per wheel
+//        float A_cm = calculate_distance_from_ticks((int64_t)A_total_ticks);
+//        float C_cm = calculate_distance_from_ticks((int64_t)C_total_ticks);
+//
+//        // Use max of the two wheels for forward progress (avoids undercounting if one wheel stalls)
+//        float travelled_cm = fmaxf(A_cm, C_cm);
+//
+//        // Yaw correction
+//        if (!SharedData_GetSensorData(&sd)) {
+//            continue;
+//        }
+//
+//        float currentYaw = sd.yaw_angle_deg;
+//        float error_yaw = currentYaw - startYaw;
+//
+//        // Wrap error to [-180, 180]
+//        if (error_yaw > 180.0f)  error_yaw -= 360.0f;
+//        if (error_yaw < -180.0f) error_yaw += 360.0f;
+//        float heading_correction = Kp_yaw * error_yaw;
+//
+//        // Apply correction directly to PWM
+//        int32_t pwm_left  = (int32_t)base_pwm_left  - (int32_t)heading_correction;
+//        int32_t pwm_right = (int32_t)base_pwm_right + (int32_t)heading_correction;
+//
+//        // Clamp to safe range
+//        if (pwm_left < 0) pwm_left = 0;
+//        if (pwm_right < 0) pwm_right = 0;
+//
+//        Motors_ForwardCounts((uint32_t)pwm_left, (uint32_t)pwm_right);
+//
+//        // Stop if distance reached
+//        if (travelled_cm >= target_cm - 4.0f) {
+//            break;
+//        }
+//    }
+//}
+
+void Robot_MoveBackward(float target_cm,
+                        uint32_t base_pwm_left, uint32_t base_pwm_right)
+{
+    SharedSensorData_t data;
+    (void)target_cm;
+
+    if (!g_motion_goal.active) {
+        s_backward_ctx.pwm_posted = 0U;
+        s_backward_ctx.brake_sent = 0U;
+        return;
+    }
+
+    if (!g_motion_goal.started) {
+        if (!SharedData_GetSensorData(&data)) return;
+
+        g_motion_goal.start_distance_cm = data.distance_traveled_cm;
+        g_motion_goal.start_left_ticks  = data.left_encoder_ticks;
+        g_motion_goal.start_right_ticks = data.right_encoder_ticks;
+        g_motion_goal.start_yaw_deg     = data.yaw_angle_deg;
+        g_motion_goal.started           = 1;
+        g_motion_goal.completed         = 0;
+
+        s_backward_ctx.pwm_posted = 0U;
+        s_backward_ctx.brake_sent = 0U;
+        MotorCommand_RequestStop();
+        MotorCommand_ResetCache();
+    }
+
+    if (!SharedData_GetSensorData(&data)) return;
+
+    // yaw correction is inverted when driving backward
+    float error_yaw = wrap180(data.yaw_angle_deg - g_motion_goal.start_yaw_deg);
+
+    if (fabsf(error_yaw) > 1.0f) {
+        if (error_yaw > 0.0f) {
+            // backwards needs opposite steering to keep straight
+            Servo_SlightRight();
+        } else {
+            Servo_SlightLeft();
+        }
+    } else {
+        Servo_Center();
+    }
+
+    if (!s_backward_ctx.pwm_posted) {
+        if (MotorCommand_Ensure(MOTOR_CMD_BACKWARD, base_pwm_left, base_pwm_right)) {
+            s_backward_ctx.pwm_posted = 1U;
+        }
+    }
+
+    // progress is how much we've moved NEGATIVE from the start (make it positive)
+    float moved = g_motion_goal.start_distance_cm - data.distance_traveled_cm;
+    if (moved < 0.0f) moved = 0.0f;
+
+    if (moved >= fabsf(g_motion_goal.target_distance_cm)) {
+        if (!s_backward_ctx.brake_sent) {
+            MotorCommand_RequestBrake();
+            MotorCommand_RequestStop();
+            s_backward_ctx.brake_sent = 1U;
+        }
+
+        Servo_Center();
+        g_motion_goal.active             = 0;
+        g_motion_goal.started            = 0;
+        g_motion_goal.completed          = 1;
+        g_motion_goal.target_distance_cm = 0.0f;
+        current_robot_state              = ROBOT_STATE_IDLE;
+        MotorCommand_ResetCache();
+        s_backward_ctx.pwm_posted = 0U;
+        s_backward_ctx.brake_sent = 0U;
+    }
+}
+
+void Car_Turn(float angleDeg)
+{
+    g_motion_goal.target_distance_cm = 0.0f;
+    g_motion_goal.target_angle_deg   = angleDeg;
+    g_motion_goal.active             = 1;
+    g_motion_goal.started            = 0;
+    g_motion_goal.completed          = 0;
+    g_motion_goal.ack_sent           = 0;
+    g_motion_goal.turn_backward      = 0;
+
+    float yaw_now = IMU_GetYawLatest();               // [0..360)
+	g_motion_goal.start_yaw_deg      = yaw_now;
+	g_motion_goal.target_abs_yaw_deg = wrap360(yaw_now + angleDeg);
+	g_motion_goal.snap_needed        = 0;
+	g_motion_goal.snap_active        = 0;
+
+    if (angleDeg < 0.0f) {
+        current_robot_state = ROBOT_STATE_TURNING_LEFT;
+    } else if (angleDeg > 0.0f) {
+        current_robot_state = ROBOT_STATE_TURNING_RIGHT;
+    }
+
+    MotorCommand_RequestStop();
+    MotorCommand_ResetCache();
+}
+
+
+void Robot_MoveAndTurnContinuous(float distance_cm,
+                                 float target_speed,
+                                 float Kp, float Ki, float Kd,
+                                 uint32_t base_pwm_left,
+                                 uint32_t base_pwm_right,
+                                 float angleDeg)
+{
+    // Step 1: Move forward using PID (no brake at the end)
+
+    // Step 2: Flow straight into the turn
+    Car_Turn(angleDeg);
+}
+
+
+/* car_turn.c */
+/* ... keep your existing Robot_MoveStraight() and Robot_MoveStraight_NoBrake() ... */
+
+/* ========= NEW: Non-blocking turn, called periodically from ControlTask =========
+   Uses g_motion_goal fields:
+     - target_angle_deg: signed angle (+right, -left)
+     - started / completed / active
+     - start_yaw_deg set on first entry
+*/
+//void Robot_TurnUpdate(void)
+//{
+//    if (!g_motion_goal.active) return;
+//    if (fabsf(g_motion_goal.target_angle_deg) < 0.001f) return; // not a turn goal
+//
+//    SharedSensorData_t sd;
+//    if (!SharedData_GetSensorData(&sd)) return;
+//
+//    // one-time setup
+//    if (!g_motion_goal.started) {
+//        g_motion_goal.start_yaw_deg = sd.yaw_angle_deg;
+//
+//        if (g_motion_goal.target_angle_deg < 0.0f) {
+//            // left turn
+//            Servo_Left();
+//            MotorA_Brake();                  // lock left (inner) wheel
+//            current_robot_state = ROBOT_STATE_TURNING_LEFT;
+//        } else {
+//            // right turn
+//            Servo_Right();
+//            MotorC_Brake();                  // lock right (inner) wheel
+//            current_robot_state = ROBOT_STATE_TURNING_RIGHT;
+//        }
+//        g_motion_goal.started   = 1;
+//        g_motion_goal.completed = 0;
+//    }
+//
+//    // delta from start (wrap to [-180, 180])
+//    float currentYaw = sd.yaw_angle_deg;
+//    float delta = currentYaw - g_motion_goal.start_yaw_deg;
+//    if (delta > 180.0f)  delta -= 360.0f;
+//    if (delta < -180.0f) delta += 360.0f;
+//
+//    /* --- FIX: reverse mapping for backward pivots ---
+//       Forward:  left  = -90, right = +90
+//       Backward: left  = +90, right = -90  (swap)
+//    */
+//    const bool turn_left = (g_motion_goal.target_angle_deg < 0.0f);
+//    float target_rel;
+//    if (!g_motion_goal.turn_backward) {
+//        target_rel = turn_left ? -90.0f :  90.0f;
+//    } else {
+//        target_rel = turn_left ?  90.0f : -90.0f;  // swapped for backward
+//    }
+//
+//    const float tol_deg          = 4.0f;     // precise
+//    const float slow_window_deg  = 10.0f;    // slow near target
+//    const uint32_t TURN_PWM_FAST = 4500;
+//    const uint32_t TURN_PWM_SLOW = 3300;
+//
+//    float rem = target_rel - delta;
+//
+//    // done?
+//    if (fabsf(rem) <= tol_deg) {
+//        Motors_Stop();
+//        Servo_Center();
+//
+//        g_motion_goal.active           = 0;
+//        g_motion_goal.started          = 0;
+//        g_motion_goal.completed        = 1;
+//        g_motion_goal.target_angle_deg = 0.0f;
+//        g_motion_goal.turn_backward    = 0;
+//        current_robot_state            = ROBOT_STATE_IDLE;
+//        return;
+//    }
+//
+//    // choose speed based on remaining angle
+//    uint32_t turn_pwm = (fabsf(rem) <= slow_window_deg) ? TURN_PWM_SLOW : TURN_PWM_FAST;
+//
+//    // drive only the outer wheel, forward OR reverse depending on turn_backward
+//    if (turn_left) {
+//        // LEFT pivot → outer = right wheel
+//        if (g_motion_goal.turn_backward) {
+//            Motors_ReverseCounts(0, turn_pwm);  // right reverse
+//        } else {
+//            Motors_ForwardCounts(0, turn_pwm);  // right forward
+//        }
+//    } else {
+//        // RIGHT pivot → outer = left wheel
+//        if (g_motion_goal.turn_backward) {
+//            Motors_ReverseCounts(turn_pwm, 0);  // left reverse
+//        } else {
+//            Motors_ForwardCounts(turn_pwm, 0);  // left forward
+//        }
+//    }
+//}
+//
+//
+// ---------- helpers ----------
+
+
+// Compact profile for the current turn request
+typedef struct {
+    uint8_t  in_use;
+    uint8_t  turn_right;       // cached net direction (after backward flip)
+    float    target_deg;       // signed target relative to start yaw
+    float    tolerance_deg;    // completion tolerance
+    float    slow_window_deg;  // window to drop to slow PWM
+    uint32_t outer_fast_pwm;
+    uint32_t inner_fast_pwm;
+    uint32_t outer_slow_pwm;
+    uint32_t inner_slow_pwm;
+} TurnCtx_t;
+
+static TurnCtx_t s_turn = {0};
+
+static inline float clampf(float value, float lo, float hi)
+{
+    if (value < lo) return lo;
+    if (value > hi) return hi;
+    return value;
+}
+
+// Forward mapping:
+// - Left commands are negative, right commands positive.
+// - If turning "backward", left/right sense flips.
+// Return true if net desired yaw is to the right (positive).
+static bool net_turn_right(bool cmd_left_sign_is_negative, bool backward) {
+    bool is_left = cmd_left_sign_is_negative ^ backward;
+    return !is_left;
+}
+
+//void Robot_TurnUpdate(void)
+//{
+//    if (!g_motion_goal.active) return;
+//    if (fabsf(g_motion_goal.target_angle_deg) < 0.001f) return; // not a turn goal
+//
+//    SharedSensorData_t sd;
+//    if (!SharedData_GetSensorData(&sd)) return;
+//
+//    // --- very gentle, constant PWMs for observation ---
+//    const uint32_t PWM_OUTER = 2950;   // outer wheel
+//    const uint32_t PWM_INNER = 2650;   // inner wheel (slightly less)
+//    const float    TOL_DEG   = 1.0f;   // phase completion tolerance
+//
+//    // one-time setup
+//    if (!g_motion_goal.started) {
+//        g_motion_goal.start_yaw_deg = sd.yaw_angle_deg;
+//
+//        // Decide net sign of final 90° (accounting for backward flip)
+//        const bool cmd_left_is_negative = (g_motion_goal.target_angle_deg < 0.0f);
+//        const bool backward             = (g_motion_goal.turn_backward != 0);
+//        const bool net_right            = net_turn_right(cmd_left_is_negative, backward);
+//
+//        const float total_abs = fminf(fabsf(g_motion_goal.target_angle_deg), 90.0f);
+//        const float total_deg = net_right ? +total_abs : -total_abs; // clamp to ±90
+//
+//        // Phase targets are both relative to the same start_yaw:
+//        s_turn.tgt_phase0_deg = (total_deg > 0.0f ? +45.0f : -45.0f);
+//        s_turn.tgt_phase1_deg = (total_deg > 0.0f ? +90.0f : -90.0f);
+//        s_turn.phase          = 0;
+//        s_turn.in_use         = 1;
+//
+//        // Steering for phase 0
+//        if (net_right ^ backward) Servo_Right(); else Servo_Left();
+//        current_robot_state     = net_right ? ROBOT_STATE_TURNING_RIGHT : ROBOT_STATE_TURNING_LEFT;
+//
+//        g_motion_goal.started   = 1;
+//        g_motion_goal.completed = 0;
+//    }
+//
+//    // Current progress
+//    const float currentYaw = sd.yaw_angle_deg;
+//    const float delta      = wrap180(currentYaw - g_motion_goal.start_yaw_deg);
+//
+//    // Pick current phase target (relative to start yaw)
+//    const float tgt_rel = (s_turn.phase == 0) ? s_turn.tgt_phase0_deg : s_turn.tgt_phase1_deg;
+//    const float rem     = tgt_rel - delta;  // remaining angle for this phase
+//
+//    // Phase completion (NO overshoot logic; just tolerance)
+//    if (fabsf(rem) <= TOL_DEG) {
+//        if (s_turn.phase == 0) {
+//            // switch to phase 1: opposite arc at same slow power
+//            s_turn.phase = 1;
+//            osDelay(1000);
+//            const bool cmd_left_is_negative = (g_motion_goal.target_angle_deg < 0.0f);
+//            const bool backward             = (g_motion_goal.turn_backward != 0);
+//            const bool net_right            = net_turn_right(cmd_left_is_negative, backward);
+//
+//            // Opposite steering in phase 1
+//            if (net_right ^ backward) Servo_Left(); else Servo_Right();
+//
+//        } else {
+//            // Finished second phase → stop & clean up
+//        	Motors_Brake();
+//            Motors_Stop();
+//            Servo_Center();
+//
+//            s_turn.in_use = 0;
+//            g_motion_goal.active           = 0;
+//            g_motion_goal.started          = 0;
+//            g_motion_goal.completed        = 1;
+//            g_motion_goal.target_angle_deg = 0.0f;
+//            g_motion_goal.turn_backward    = 0;
+//            current_robot_state            = ROBOT_STATE_IDLE;
+//            return;
+//        }
+//    }
+//
+//    // Drive plan for each phase (still slow)
+//    const bool cmd_left_is_negative = (g_motion_goal.target_angle_deg < 0.0f);
+//    const bool backward             = (g_motion_goal.turn_backward != 0);
+//    const bool net_right            = net_turn_right(cmd_left_is_negative, backward);
+//
+//    bool phase_turn_right, phase_forward;
+//
+//    if (s_turn.phase == 0) {
+//        // first 45° arc
+//        phase_turn_right = net_right;
+//        phase_forward    = !backward;     // start forward unless command is a "back" turn
+//    } else {
+//        // second 45° arc is the opposite yaw direction AND opposite drive direction
+//        phase_turn_right = !net_right;
+//        phase_forward    = backward;      // opposite of phase 0
+//    }
+//
+//    drive_diff(phase_turn_right, phase_forward, PWM_OUTER, PWM_INNER);
+//}
+
+//static TurnCtx_t s_turn = {0};
+//static float s_prev_rem = 0.0f;
+//static bool  s_prev_rem_valid = false;
+//#define SCALE 0.95f
+//#define PHASE0 (45.0f*SCALE)
+//#define PHASE1 (90.0f*SCALE)
+//void Robot_TurnUpdate(void)
+//{
+//    if (!g_motion_goal.active) return;
+//    if (fabsf(g_motion_goal.target_angle_deg) < 0.001f) return;
+//
+//    SharedSensorData_t sd;
+//    if (!SharedData_GetSensorData(&sd)) return;
+//
+//    const uint32_t PWM_OUTER = 2950;
+//    const uint32_t PWM_INNER = 2650;
+//    const uint32_t PWM_BOOST = 100; //cz one of the motors weak ash
+//    const float    TOL_DEG   = 1.0f;
+//    uint32_t pwm_outer = PWM_OUTER;
+//    uint32_t pwm_inner = PWM_INNER;
+//
+//    const bool cmd_left_is_negative = (g_motion_goal.target_angle_deg < 0.0f);
+//    const bool backward             = (g_motion_goal.turn_backward != 0);
+//    const bool net_right            = net_turn_right(cmd_left_is_negative, backward);
+//
+//    if (net_right){
+//    	if(s_turn.phase == 1){
+//    		pwm_outer += PWM_BOOST;
+//    		pwm_inner += PWM_BOOST;
+//    	}
+//    } else {
+//    	if(s_turn.phase == 0){
+//    	    pwm_outer += PWM_BOOST;
+//    	    pwm_inner += PWM_BOOST;
+//    	}
+//    }
+//
+//    if (!g_motion_goal.started) {
+//        g_motion_goal.start_yaw_deg = sd.yaw_angle_deg;
+//
+//        const float total_abs = fminf(fabsf(g_motion_goal.target_angle_deg), 90.0f);
+//        const float total_deg = net_right ? +total_abs : -total_abs;
+//
+//        s_turn.tgt_phase0_deg = (total_deg > 0.0f ? +PHASE0 : -PHASE0);
+//        s_turn.tgt_phase1_deg = (total_deg > 0.0f ? +PHASE1 : -PHASE1);
+//        s_turn.phase          = 0;
+//        s_turn.in_use         = 1;
+//        s_prev_rem_valid      = false;
+//
+//        if (net_right ^ backward) Servo_Right(); else Servo_Left();
+//        current_robot_state = net_right ? ROBOT_STATE_TURNING_RIGHT : ROBOT_STATE_TURNING_LEFT;
+//
+//        g_motion_goal.started   = 1;
+//        g_motion_goal.completed = 0;
+//    }
+//
+//    const float currentYaw = sd.yaw_angle_deg;
+//    const float delta      = wrap180(currentYaw - g_motion_goal.start_yaw_deg);
+//
+//    const float tgt_rel = (s_turn.phase == 0) ? s_turn.tgt_phase0_deg : s_turn.tgt_phase1_deg;
+//    const float rem     = tgt_rel - delta;
+//
+//    const bool crossed = s_prev_rem_valid &&
+//                         ((rem > 0.0f && s_prev_rem < 0.0f) ||
+//                          (rem < 0.0f && s_prev_rem > 0.0f));
+//
+//    if (fabsf(rem) <= TOL_DEG || crossed) {
+//        Motors_Brake();
+//        Motors_Stop();
+//        Servo_Center();
+//        s_prev_rem_valid = false;
+//
+//        if (s_turn.phase == 0) {
+//            s_turn.phase = 1;
+//            osDelay(1000);
+//
+//            if (net_right ^ backward) Servo_Left(); else Servo_Right();
+//            return;
+//        } else {
+//            s_turn.in_use = 0;
+//            g_motion_goal.active           = 0;
+//            g_motion_goal.started          = 0;
+//            g_motion_goal.completed        = 1;
+//            g_motion_goal.target_angle_deg = 0.0f;
+//            g_motion_goal.turn_backward    = 0;
+//            current_robot_state            = ROBOT_STATE_IDLE;
+//            return;
+//        }
+//    }
+//
+//    bool phase_turn_right, phase_forward;
+//
+//    if (s_turn.phase == 0) {
+//        phase_turn_right = net_right;
+//        phase_forward    = !backward;
+//    } else {
+//        phase_turn_right = !net_right;
+//        phase_forward    = backward;
+//    }
+//
+//    drive_diff(phase_turn_right, phase_forward, pwm_outer, pwm_inner);
+//
+//    s_prev_rem = rem;
+//    s_prev_rem_valid = true;
+//}
+#define TURN_TARGET_MIN_DEG          15.0f
+#define TURN_TARGET_MAX_DEG         180.0f
+
+#define TURN_TOLERANCE_BASE_DEG       2.0f
+#define TURN_TOLERANCE_MIN_DEG        0.8f
+#define TURN_TOLERANCE_MAX_DEG        3.0f
+
+#define TURN_SLOW_WINDOW_BASE_DEG    12.0f
+#define TURN_SLOW_WINDOW_MIN_DEG      3.0f
+#define TURN_SLOW_WINDOW_MAX_DEG     24.0f
+
+#define TURN_PWM_OUTER_FAST_BASE   3300U
+#define TURN_PWM_OUTER_SLOW_BASE   2700U
+#define TURN_PWM_INNER_FAST_BASE   2800U
+#define TURN_PWM_INNER_SLOW_BASE   2400U
+
+#define TURN_PWM_OUTER_FAST_MIN    2400U
+#define TURN_PWM_OUTER_SLOW_MIN    2000U
+#define TURN_PWM_INNER_FAST_MIN    2000U
+#define TURN_PWM_INNER_SLOW_MIN    1600U
+
+#define TURN_PWM_SCALE_MIN           0.6f
+#define TURN_PWM_SCALE_MAX           1.3f
+
+#define TURN_BIAS_RIGHT_BASE_DEG     1.0f
+#define TURN_BIAS_LEFT_BASE_DEG     -1.0f
+
+static void TurnProfile_Init(TurnCtx_t *profile, float requested_deg, bool turn_right)
+{
+    float abs_req = fabsf(requested_deg); // still clamp target range only
+    abs_req = clampf(abs_req, TURN_TARGET_MIN_DEG, TURN_TARGET_MAX_DEG);
+
+    profile->in_use     = 1U;
+    profile->turn_right = turn_right ? 1U : 0U;
+
+    // Apply small fixed bias only for shallow turns (< 60°) to preserve 45° calibration
+    float bias = 0.0f;
+    if (abs_req <= 60.0f) {
+        bias = turn_right ? TURN_BIAS_RIGHT_BASE_DEG : TURN_BIAS_LEFT_BASE_DEG;
+    }
+    if (abs_req <= 100.0f && abs_req > 60.0f) {
+            bias = turn_right ? 0.5f : 3.5f;
+        }
+    const float signed_target = (turn_right ? abs_req : -abs_req) + bias;
+    profile->target_deg = clampf(signed_target, -TURN_TARGET_MAX_DEG, TURN_TARGET_MAX_DEG);
+
+    float tol_scale = 1.0f;
+    float slow_scale = 1.0f;
+    float pwm_scale = 1.0f;
+
+    if (abs_req >= 175.0f) {
+        tol_scale  = 0.25f;
+        slow_scale = 0.25f;
+        pwm_scale  = 0.60f;
+    } else if (abs_req >= 90.0f) {
+        tol_scale  = 1.50f;
+        slow_scale = 0.50f;
+        pwm_scale  = 0.80f;
+    }
+
+    profile->tolerance_deg = clampf(TURN_TOLERANCE_BASE_DEG * tol_scale,
+                                     TURN_TOLERANCE_MIN_DEG,
+                                     TURN_TOLERANCE_MAX_DEG);
+
+    profile->slow_window_deg = clampf(TURN_SLOW_WINDOW_BASE_DEG * slow_scale,
+                                      TURN_SLOW_WINDOW_MIN_DEG,
+                                      TURN_SLOW_WINDOW_MAX_DEG);
+
+    uint32_t outer_fast = (uint32_t)(TURN_PWM_OUTER_FAST_BASE * pwm_scale + 0.5f);
+    uint32_t outer_slow = (uint32_t)(TURN_PWM_OUTER_SLOW_BASE * pwm_scale + 0.5f);
+    uint32_t inner_fast = (uint32_t)(TURN_PWM_INNER_FAST_BASE * pwm_scale + 0.5f);
+    uint32_t inner_slow = (uint32_t)(TURN_PWM_INNER_SLOW_BASE * pwm_scale + 0.5f);
+
+    if (outer_fast < TURN_PWM_OUTER_FAST_MIN) outer_fast = TURN_PWM_OUTER_FAST_MIN;
+    if (outer_slow < TURN_PWM_OUTER_SLOW_MIN) outer_slow = TURN_PWM_OUTER_SLOW_MIN;
+    if (inner_fast < TURN_PWM_INNER_FAST_MIN) inner_fast = TURN_PWM_INNER_FAST_MIN;
+    if (inner_slow < TURN_PWM_INNER_SLOW_MIN) inner_slow = TURN_PWM_INNER_SLOW_MIN;
+
+    profile->outer_fast_pwm = outer_fast;
+    profile->outer_slow_pwm = outer_slow;
+    profile->inner_fast_pwm = inner_fast;
+    profile->inner_slow_pwm = inner_slow;
+}
+
+static float s_prev_rem = 0.0f;
+static bool  s_prev_rem_valid = false;
+
+void Robot_TurnUpdate(void)
+{
+    if (!g_motion_goal.active) {
+        MotorCommand_RequestStop();
+        s_prev_rem_valid = false;
+        s_turn = (TurnCtx_t){0};
+        return;
+    }
+    if (fabsf(g_motion_goal.target_angle_deg) < 0.001f) {
+        MotorCommand_RequestStop();
+        g_motion_goal.active = 0;
+        s_turn = (TurnCtx_t){0};
+        return;
+    }
+
+    SharedSensorData_t sd;
+    if (!SharedData_GetSensorData(&sd)) {
+        MotorCommand_RequestStop();
+        return;
+    }
+
+    const bool cmd_left_sign = (g_motion_goal.target_angle_deg < 0.0f);
+    const bool backward      = (g_motion_goal.turn_backward != 0);
+    const bool net_right     = net_turn_right(cmd_left_sign, backward);
+
+    if (!g_motion_goal.started) {
+        g_motion_goal.start_yaw_deg = sd.yaw_angle_deg;
+        s_prev_rem_valid = false;
+
+        TurnProfile_Init(&s_turn, g_motion_goal.target_angle_deg, net_right);
+        g_motion_goal.started   = 1U;
+        g_motion_goal.completed = 0U;
+
+        if (net_right ^ backward) Servo_Right();
+        else                      Servo_Left();
+
+        MotorCommand_RequestStop();
+        MotorCommand_ResetCache();
+        current_robot_state = net_right ? ROBOT_STATE_TURNING_RIGHT : ROBOT_STATE_TURNING_LEFT;
+        return;
+    }
+
+    const float delta = wrap180(sd.yaw_angle_deg - g_motion_goal.start_yaw_deg);
+    const float tgt   = s_turn.target_deg;
+    const float rem   = tgt - delta;
+
+    const bool crossed = s_prev_rem_valid &&
+                         ((rem > 0.0f && s_prev_rem < 0.0f) ||
+                          (rem < 0.0f && s_prev_rem > 0.0f));
+
+    if (fabsf(rem) <= s_turn.tolerance_deg || crossed) {
+        MotorCommand_RequestBrake();
+        MotorCommand_RequestStop();
+        Servo_Center();
+
+        g_motion_goal.active           = 0U;
+        g_motion_goal.started          = 0U;
+        g_motion_goal.completed        = 1U;
+
+        // NEW: ask for a snap pass using the absolute target we computed earlier
+        //g_motion_goal.snap_needed      = 1U;
+        // leave target_abs_yaw_deg as-is for the snap block to use
+        if (fabsf(g_motion_goal.target_angle_deg) > 50.0f) {
+        	g_motion_goal.snap_needed = 1U;
+        }
+
+        g_motion_goal.target_angle_deg = 0.0f;
+        g_motion_goal.turn_backward    = 0U;
+        current_robot_state            = ROBOT_STATE_IDLE;
+        s_prev_rem_valid               = false;
+        s_turn = (TurnCtx_t){0};
+        return;
+    }
+
+
+    const bool phase_forward = !backward;
+    const bool turn_right    = s_turn.in_use ? (s_turn.turn_right != 0U) : net_right;
+
+    uint32_t outer_fast = s_turn.outer_fast_pwm;
+    uint32_t inner_fast = s_turn.inner_fast_pwm;
+    uint32_t outer_slow = s_turn.outer_slow_pwm;
+    uint32_t inner_slow = s_turn.inner_slow_pwm;
+
+    if (turn_right) {
+        outer_fast += 50U;
+        outer_slow += 40U;
+    } else {
+        outer_fast -= 30U;
+        outer_slow -= 40U;
+    }
+
+    const bool slow_zone = (fabsf(rem) <= s_turn.slow_window_deg);
+    const uint32_t pwm_outer = slow_zone ? outer_slow : outer_fast;
+    const uint32_t pwm_inner = slow_zone ? inner_slow : inner_fast;
+
+    uint32_t left_pwm = 0U, right_pwm = 0U;
+    if (phase_forward) {
+        if (turn_right) {
+            left_pwm  = pwm_outer;
+            right_pwm = pwm_inner;
+            MotorCommand_Ensure(MOTOR_CMD_FORWARD, left_pwm, right_pwm);
+        } else {
+            left_pwm  = pwm_inner;
+            right_pwm = pwm_outer;
+            MotorCommand_Ensure(MOTOR_CMD_FORWARD, left_pwm, right_pwm);
+        }
+    } else {
+        if (turn_right) {
+            left_pwm  = pwm_outer;
+            right_pwm = pwm_inner;
+            MotorCommand_Ensure(MOTOR_CMD_BACKWARD, left_pwm, right_pwm);
+        } else {
+            left_pwm  = pwm_inner;
+            right_pwm = pwm_outer;
+            MotorCommand_Ensure(MOTOR_CMD_BACKWARD, left_pwm, right_pwm);
+        }
+    }
+
+    s_prev_rem = rem;
+    s_prev_rem_valid = true;
+}
+

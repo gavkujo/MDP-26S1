@@ -1,0 +1,94 @@
+# -----------------------------
+# OS / Editor
+# -----------------------------
+.DS_Store
+**/.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# -----------------------------
+# Python
+# -----------------------------
+__pycache__/
+**/__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+htmlcov/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Packaging
+*.egg-info/
+dist/
+build/
+
+# -----------------------------
+# Node / Next.js
+# -----------------------------
+node_modules/
+**/node_modules/
+.next/
+**/.next/
+out/
+.npm/
+
+# -----------------------------
+# Logs / Runtime outputs
+# -----------------------------
+logs/
+**/logs/
+*.log
+*.tmp
+*.pid
+
+# -----------------------------
+# Data / model artifacts
+# -----------------------------
+*.pt
+*.pth
+*.onnx
+*.tflite
+uploads/
+**/uploads/
+
+# -----------------------------
+# STM32 / Embedded build artifacts
+# -----------------------------
+Debug/
+Release/
+**/Debug/
+**/Release/
+
+# Tool-generated files
+*.o
+*.obj
+*.d
+*.su
+*.elf
+*.axf
+*.map
+*.bin
+*.hex
+*.list
+*.dep
+
+# -----------------------------
+# Misc
+# -----------------------------
+.cache/
+tmp/
+temp/

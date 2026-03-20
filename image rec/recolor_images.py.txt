@@ -1,0 +1,172 @@
+# import os
+# import cv2
+# import numpy as np
+# import random
+# from shutil import copy2
+# from tqdm import tqdm
+
+# # -------------------------
+# # Recoloring function
+# # -------------------------
+# def recolor_bg_keep_text_black(filename):
+#     img = cv2.imread(filename, cv2.IMREAD_GRAYSCALE)
+#     if img is None:
+#         print(f"⚠️ Could not read {filename}")
+#         return None
+
+#     # Threshold: text (black) vs background (white)
+#     _, mask = cv2.threshold(img, 200, 255, cv2.THRESH_BINARY)
+
+#     # Generate bright background color
+#     while True:
+#         bg_color = np.array([random.randint(0, 255),
+#                              random.randint(0, 255),
+#                              random.randint(0, 255)], dtype=np.uint8)
+#         brightness = 0.299*bg_color[2] + 0.587*bg_color[1] + 0.114*bg_color[0]
+#         if brightness > 127:
+#             break
+
+#     text_color = np.array([0, 0, 0], dtype=np.uint8)
+
+#     h, w = img.shape
+#     color_img = np.zeros((h, w, 3), dtype=np.uint8)
+
+#     color_img[mask == 255] = bg_color   # background
+#     color_img[mask == 0] = text_color   # text
+
+#     return color_img
+
+# # -------------------------
+# # Apply to all images in a dataset folder
+# # -------------------------
+# def recolor_yolo_dataset(root_folder, save_root=None):
+#     """
+#     root_folder: the folder containing train/test/valid subfolders
+#     save_root: if specified, recolored images will be saved here keeping same structure
+#     """
+#     splits = ["train", "test", "valid"]
+
+#     for split in splits:
+#         img_folder = os.path.join(root_folder, split, "images")
+#         lbl_folder = os.path.join(root_folder, split, "labels")
+
+#         if save_root:
+#             out_img_folder = os.path.join(save_root, split, "images")
+#             out_lbl_folder = os.path.join(save_root, split, "labels")
+#             os.makedirs(out_img_folder, exist_ok=True)
+#             os.makedirs(out_lbl_folder, exist_ok=True)
+#         else:
+#             # overwrite images in-place
+#             out_img_folder = img_folder
+#             out_lbl_folder = lbl_folder
+
+#         files = [f for f in os.listdir(img_folder) if f.lower().endswith((".jpg", ".jpeg", ".png"))]
+
+#         for file in tqdm(files, desc=f"Processing {split} images"):
+#             input_path = os.path.join(img_folder, file)
+#             output_path = os.path.join(out_img_folder, file)
+
+#             # recolor image
+#             recolored = recolor_bg_keep_text_black(input_path)
+#             if recolored is not None:
+#                 cv2.imwrite(output_path, recolored)
+
+#             # copy label file if using save_root
+#             if save_root:
+#                 lbl_file = os.path.splitext(file)[0] + ".txt"
+#                 lbl_src = os.path.join(lbl_folder, lbl_file)
+#                 lbl_dst = os.path.join(out_lbl_folder, lbl_file)
+#                 if os.path.exists(lbl_src):
+#                     copy2(lbl_src, lbl_dst)
+
+#     print("✅ Finished recoloring dataset.")
+
+import os
+import cv2
+import numpy as np
+import random
+from shutil import copy2
+from tqdm import tqdm
+
+# -------------------------
+# Recoloring function
+# -------------------------
+def recolor_bg_keep_text_black(filename):
+    img = cv2.imread(filename, cv2.IMREAD_GRAYSCALE)
+    if img is None:
+        print(f"⚠️ Could not read {filename}")
+        return None
+
+    # Threshold: text (black) vs background (white)
+    _, mask = cv2.threshold(img, 200, 255, cv2.THRESH_BINARY)
+
+    # Generate bright background color
+    while True:
+        bg_color = np.array([random.randint(0, 255),
+                             random.randint(0, 255),
+                             random.randint(0, 255)], dtype=np.uint8)
+        brightness = 0.299*bg_color[2] + 0.587*bg_color[1] + 0.114*bg_color[0]
+        if brightness > 127:  # ensure bright enough
+            break
+
+    text_color = np.array([0, 0, 0], dtype=np.uint8)
+
+    h, w = img.shape
+    color_img = np.zeros((h, w, 3), dtype=np.uint8)
+
+    color_img[mask == 255] = bg_color   # background
+    color_img[mask == 0] = text_color   # text
+
+    return color_img
+
+# -------------------------
+# Apply to dataset with multiple variants
+# -------------------------
+def recolor_yolo_dataset(root_folder, save_root=None, num_variants=1):
+    splits = ["train", "test", "valid"]
+
+    for split in splits:
+        img_folder = os.path.join(root_folder, split, "images")
+        lbl_folder = os.path.join(root_folder, split, "labels")
+
+        if save_root:
+            out_img_folder = os.path.join(save_root, split, "images")
+            out_lbl_folder = os.path.join(save_root, split, "labels")
+            os.makedirs(out_img_folder, exist_ok=True)
+            os.makedirs(out_lbl_folder, exist_ok=True)
+        else:
+            out_img_folder = img_folder
+            out_lbl_folder = lbl_folder
+
+        files = [f for f in os.listdir(img_folder) if f.lower().endswith((".jpg", ".jpeg", ".png"))]
+
+        for file in tqdm(files, desc=f"Processing {split} images"):
+            input_path = os.path.join(img_folder, file)
+            name, ext = os.path.splitext(file)
+
+            for i in range(num_variants):
+                # Variant filename
+                if num_variants == 1:
+                    img_out = os.path.join(out_img_folder, file)
+                    lbl_out = os.path.join(out_lbl_folder, name + ".txt")
+                else:
+                    img_out = os.path.join(out_img_folder, f"{name}_var{i}{ext}")
+                    lbl_out = os.path.join(out_lbl_folder, f"{name}_var{i}.txt")
+
+                # Recolor and save image
+                recolored = recolor_bg_keep_text_black(input_path)
+                if recolored is not None:
+                    cv2.imwrite(img_out, recolored)
+
+                # Copy/duplicate corresponding label
+                lbl_src = os.path.join(lbl_folder, name + ".txt")
+                if os.path.exists(lbl_src):
+                    copy2(lbl_src, lbl_out)
+
+    print("✅ Finished recoloring dataset.")
+
+# -------------------------
+# Usage
+# -------------------------
+# recolor_yolo_dataset("/home/users/ntu/leey0227/scratch/mdp_v2/given_images", save_root="recolored_given_images")
+recolor_yolo_dataset("/home/users/ntu/leey0227/scratch/mdp_v2/given_images", save_root="recolored_given_images", num_variants=5)

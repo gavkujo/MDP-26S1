@@ -1,0 +1,99 @@
+# import os
+# import random
+# import shutil
+
+# # Paths
+# # base_dir = "/home/users/ntu/leey0227/scratch/mdp_v2/given_zoomed_images"
+# base_dir = "/home/users/ntu/leey0227/scratch/mdp_v2/Bg-coloured-imgs-6"
+# train_dir = os.path.join(base_dir, "train/images")
+# valid_dir = os.path.join(base_dir, "valid/images")
+# test_dir = os.path.join(base_dir, "test/images")
+
+# # Make sure the output folders exist
+# os.makedirs(valid_dir, exist_ok=True)
+# os.makedirs(test_dir, exist_ok=True)
+
+# # Get all image files from train/images
+# all_images = [f for f in os.listdir(train_dir) if f.lower().endswith(('.png', '.jpg', '.jpeg'))]
+
+# # Shuffle for randomness
+# random.shuffle(all_images)
+
+# # Calculate split sizes
+# total = len(all_images)
+# valid_size = int(0.10 * total)
+# test_size = int(0.15 * total)
+
+# valid_files = all_images[:valid_size]
+# test_files = all_images[valid_size:valid_size + test_size]
+
+# print(f"Total images: {total}")
+# print(f"Moving {len(valid_files)} to valid/images")
+# print(f"Moving {len(test_files)} to test/images")
+
+# # Move validation images
+# for f in valid_files:
+#     shutil.move(os.path.join(train_dir, f), os.path.join(valid_dir, f))
+
+# # Move test images
+# for f in test_files:
+#     shutil.move(os.path.join(train_dir, f), os.path.join(test_dir, f))
+
+# print("✅ Done splitting into train/valid/test.")
+
+import os
+import random
+import shutil
+
+# Paths
+base_dir = "/home/users/ntu/leey0227/scratch/mdp_v2/task2_3"
+
+train_img_dir = os.path.join(base_dir, "train/images")
+train_label_dir = os.path.join(base_dir, "train/labels")
+valid_img_dir = os.path.join(base_dir, "valid/images")
+valid_label_dir = os.path.join(base_dir, "valid/labels")
+test_img_dir = os.path.join(base_dir, "test/images")
+test_label_dir = os.path.join(base_dir, "test/labels")
+
+# Make sure the output folders exist
+os.makedirs(valid_img_dir, exist_ok=True)
+os.makedirs(valid_label_dir, exist_ok=True)
+os.makedirs(test_img_dir, exist_ok=True)
+os.makedirs(test_label_dir, exist_ok=True)
+
+# Get all image files from train/images
+all_images = [f for f in os.listdir(train_img_dir) if f.lower().endswith(('.png', '.jpg', '.jpeg'))]
+
+# Shuffle for randomness
+random.shuffle(all_images)
+
+# Calculate split sizes
+total = len(all_images)
+valid_size = int(0.10 * total)
+test_size = int(0.15 * total)
+
+valid_files = all_images[:valid_size]
+test_files = all_images[valid_size:valid_size + test_size]
+
+print(f"Total images: {total}")
+print(f"Moving {len(valid_files)} to valid/images and valid/labels")
+print(f"Moving {len(test_files)} to test/images and test/labels")
+
+# Function to move images and corresponding labels
+def move_files(files, src_img_dir, src_label_dir, dst_img_dir, dst_label_dir):
+    for f in files:
+        # Move image
+        shutil.move(os.path.join(src_img_dir, f), os.path.join(dst_img_dir, f))
+        # Move label if exists
+        label_file = os.path.splitext(f)[0] + ".txt"
+        src_label_path = os.path.join(src_label_dir, label_file)
+        if os.path.exists(src_label_path):
+            shutil.move(src_label_path, os.path.join(dst_label_dir, label_file))
+
+# Move validation images and labels
+move_files(valid_files, train_img_dir, train_label_dir, valid_img_dir, valid_label_dir)
+
+# Move test images and labels
+move_files(test_files, train_img_dir, train_label_dir, test_img_dir, test_label_dir)
+
+print("✅ Done splitting into train/valid/test with labels.")

@@ -1,0 +1,38 @@
+/*
+ * task_priorities.h
+ *
+ *  Created on: Sep 25, 2025
+ *      Author: MDP Team
+ */
+
+#ifndef INC_TASK_PRIORITIES_H_
+#define INC_TASK_PRIORITIES_H_
+
+#include "cmsis_os.h"
+
+// Task Priorities (Higher number = Higher priority)
+#define COMMUNICATION_TASK_PRIORITY    (osPriority_t) osPriorityNormal
+#define CONTROL_TASK_PRIORITY          (osPriority_t) osPriorityNormal 
+#define MOTOR_TASK_PRIORITY            (osPriority_t) osPriorityAboveNormal
+#define SENSOR_TASK_PRIORITY           (osPriority_t) osPriorityAboveNormal1
+#define OLED_TASK_PRIORITY             (osPriority_t) osPriorityNormal
+
+// Task Stack Sizes (in words, multiply by 4 for bytes)
+#define COMMUNICATION_TASK_STACK_SIZE  256
+#define CONTROL_TASK_STACK_SIZE        512
+#define MOTOR_TASK_STACK_SIZE          256
+#define SENSOR_TASK_STACK_SIZE         256
+#define OLED_TASK_STACK_SIZE           256
+
+// Queue Sizes
+#define COMMAND_QUEUE_SIZE             5
+#define MOTOR_QUEUE_SIZE               3
+
+// Software Timer Periods (in milliseconds)
+#define ULTRASONIC_TIMER_PERIOD_MS     10
+#define ENCODER_TIMER_PERIOD_MS        10
+#define IMU_TIMER_PERIOD_MS            5
+#define IR_TIMER_PERIOD_MS             10
+#define OLED_UPDATE_PERIOD_MS          200
+
+#endif /* INC_TASK_PRIORITIES_H_ */

@@ -1,0 +1,102 @@
+#ifndef INC_ICM20948_H_
+#define INC_ICM20948_H_
+
+#include "ICM20948_ADDR.h"
+#include "ICM20948_OPTIONS.h"
+#include <stdio.h>
+#include "stm32f4xx_hal.h"
+
+// ------------------- Sensitivity scale factors -------------------
+#define GRYO_SENSITIVITY_SCALE_FACTOR_250DPS   131.0f
+#define GRYO_SENSITIVITY_SCALE_FACTOR_500DPS   65.5f
+#define GRYO_SENSITIVITY_SCALE_FACTOR_1000DPS  32.8f
+#define GRYO_SENSITIVITY_SCALE_FACTOR_2000DPS  16.4f
+
+#define ACCEL_SENSITIVITY_SCALE_FACTOR_2G      16384.0f
+#define ACCEL_SENSITIVITY_SCALE_FACTOR_4G      8192.0f
+#define ACCEL_SENSITIVITY_SCALE_FACTOR_8G      4096.0f
+#define ACCEL_SENSITIVITY_SCALE_FACTOR_16G     2048.0f
+
+#define MAG_SENSITIVITY_SCALE_FACTOR           0.15f
+
+// ------------------- Index helpers -------------------
+#define X 0
+#define Y 1
+#define Z 2
+
+#define X_HIGH_BYTE 0
+#define X_LOW_BYTE  1
+#define Y_HIGH_BYTE 2
+#define Y_LOW_BYTE  3
+#define Z_HIGH_BYTE 4
+#define Z_LOW_BYTE  5
+
+// ------------------- Device settings -------------------
+#define ICM20948_RESET             0x80
+#define ICM20948_DISABLE_SENSORS   0x00
+#define ICM20948_ENABLE_SENSORS    0x3F
+#define ICM20948_AUTO_SELECT_CLOCK 0x01
+
+// ------------------- Global bias variable -------------------
+extern float gyroBiasZ;
+
+// ------------------- Device checks -------------------
+uint8_t ICM20948_isI2cAddress1(I2C_HandleTypeDef * hi2c);
+uint8_t ICM20948_isI2cAddress2(I2C_HandleTypeDef * hi2c);
+
+// ------------------- Initialization -------------------
+void ICM20948_init(I2C_HandleTypeDef * hi2c,
+                   uint8_t selectI2cAddress,
+                   uint8_t selectGyroSensitivity,
+                   uint8_t selectAccelSensitivity);
+
+// ------------------- Sensor reads -------------------
+void ICM20948_readGyroscope_Z(I2C_HandleTypeDef * hi2c,
+                              uint8_t selectI2cAddress,
+                              uint8_t selectGyroSensitivity,
+                              float *gyroZ);
+
+void ICM20948_readAccelerometer_all(I2C_HandleTypeDef * hi2c,
+                                    uint8_t selectI2cAddress,
+                                    uint8_t selectAccelSensitivity,
+                                    float readings[3]);
+
+void ICM20948_readMagnetometer_XY(I2C_HandleTypeDef * hi2c,
+                                  float magXY[2]);
+
+// ------------------- Orientation helpers -------------------
+
+// Enable/disable magnetometer contribution (0 = gyro only baseline)
+#ifndef IMU_USE_MAG
+#define IMU_USE_MAG 1
+#endif
+
+// Expected IMU update cadence (matches IMU task period)
+#ifndef IMU_UPDATE_PERIOD_MS
+#define IMU_UPDATE_PERIOD_MS 5U
+#endif
+
+// Magnetometer fusion cadence (milliseconds)
+#ifndef IMU_MAG_UPDATE_PERIOD_MS
+#define IMU_MAG_UPDATE_PERIOD_MS 100U
+#endif
+
+// Update should be called by the dedicated IMU task at a fixed cadence
+void IMU_Update(I2C_HandleTypeDef *hi2c,
+                uint8_t selectI2cAddress,
+                uint8_t selectGyroSensitivity);
+
+// Read-only cached values (updated by IMU_Update)
+float IMU_GetYawLatest(void);
+float IMU_GetGyroZLatest(void);
+
+// Backward compatibility shim (avoids multiple readers performing sensor IO)
+float IMU_GetYaw(I2C_HandleTypeDef *hi2c,
+                 uint8_t selectI2cAddress,
+                 uint8_t selectGyroSensitivity);
+
+void IMU_CalibrateGyroZ(I2C_HandleTypeDef *hi2c,
+                        uint8_t selectI2cAddress,
+                        uint8_t selectGyroSensitivity);
+
+#endif /* INC_ICM20948_H_ */

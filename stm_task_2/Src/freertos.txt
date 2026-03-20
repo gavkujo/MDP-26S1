@@ -1,0 +1,1976 @@
+/* USER CODE BEGIN Header */
+/**
+  ******************************************************************************
+  * File Name          : freertos.c
+  * Description        : Code for freertos applications
+  ******************************************************************************
+  * @attention
+  *
+  * Copyright (c) 2025 STMicroelectronics.
+  * All rights reserved.
+  *
+  * This software is licensed under terms that can be found in the LICENSE file
+  * in the root directory of this software component.
+  * If no LICENSE file comes with this software, it is provided AS-IS.
+  *
+  ******************************************************************************
+  */
+/* USER CODE END Header */
+
+/* Includes ------------------------------------------------------------------*/
+#include "FreeRTOS.h"
+#include "task.h"
+#include "main.h"
+#include "cmsis_os.h"
+
+/* Private includes ----------------------------------------------------------*/
+/* USER CODE BEGIN Includes */
+#include "task_priorities.h"
+#include "command_parser.h"
+#include "shared_data.h"
+#include "motor.h"
+#include "servo.h"
+#include "ultrasonic.h"
+#include "encoder.h"
+#include "ICM20948.h"
+#include "ir_sensor.h"
+#include "oled.h"
+#include "car_turn.h"
+#include <stdint.h>
+#include <stdbool.h>
+#include <stdio.h>
+#include <string.h>
+#include "robot_state.h"
+#include <math.h>
+#include "servo.h"
+
+extern TIM_HandleTypeDef htim12;
+/* USER CODE END Includes */
+
+/* Private typedef -----------------------------------------------------------*/
+/* USER CODE BEGIN PTD */
+/* USER CODE END PTD */
+
+/* Private define ------------------------------------------------------------*/
+/* USER CODE BEGIN PD */
+#define UART_RX_BUFFER_SIZE 10
+#define COMMAND_TIMEOUT_MS  5000
+
+/* Make IR refresh snappy by default (can be FFoverridden in a header) */
+//#ifndef IR_TIMER_PERIOD_MS
+//#define IR_TIMER_PERIOD_MS 10  /* ms */
+//#endif
+
+/* Default IR "valid" band (only used for *Valid* helpers). Override in a header if you like. */
+#ifndef IR_VALID_MIN_CM
+#define IR_VALID_MIN_CM  10.0f
+#endif
+#ifndef IR_VALID_MAX_CM
+#define IR_VALID_MAX_CM  40.0f
+#endif
+
+#define OBSTACLE_STOP_OFFSET_CM     27.0f
+#define PHASE_B_INCH_FORWARD_CM      5.0f
+#define PHASE_B_BACKUP_CM           22.0f
+#define PHASE_D_INCH_FORWARD_CM      10.0f
+#define PHASE_E_INCH_FORWARD_CM     30.0f
+#define PHASE_E_FINAL_STOP_CM       15.0f
+/* USER CODE END PD */
+
+/* Private macro -------------------------------------------------------------*/
+/* USER CODE BEGIN PM */
+
+/* USER CODE END PM */
+
+/* Private variables ---------------------------------------------------------*/
+/* USER CODE BEGIN Variables */
+// FreeRTOS Objects
+osThreadId_t CommunicationTaskHandle;
+osThreadId_t ControlTaskHandle;
+osThreadId_t MotorTaskHandle;
+osThreadId_t OLEDTaskHandle;
+osThreadId_t IMUTaskHandle;
+osThreadId_t EncoderTaskHandle;
+
+osMessageQueueId_t xCommandQueue;
+osMessageQueueId_t xMotorQueue;
+
+osSemaphoreId_t xIMUSem;
+osSemaphoreId_t xEncoderSem;
+
+osTimerId_t xUltrasonicTimer;
+osTimerId_t xEncoderTimer;
+osTimerId_t xIMUTimer;
+osTimerId_t xIRTimer;
+
+// UART receive buffer
+uint8_t uart_rx_buffer[UART_RX_BUFFER_SIZE];
+uint8_t uart_cmd_buffer[8]; // 7 chars + null terminator
+volatile uint8_t uart_rx_index = 0;
+
+// Robot state
+volatile RobotState_t current_robot_state = ROBOT_STATE_IDLE;
+volatile bool command_in_progress = false;
+static volatile bool s_ultrasonic_sample_pending = false;
+static volatile bool s_script_start_requested = false;
+static volatile bool s_script_mode_enabled = false;
+
+typedef enum {
+  DETECT_REQ_NONE = 0,
+  DETECT_REQ_PHASE_A,
+  DETECT_REQ_PHASE_C
+} DetectionRequest_t;
+
+/* Only used during PH_E case 6 to bias steering via IR */
+static volatile bool s_final_ultra_approach = false;
+
+
+static volatile DetectionRequest_t s_detection_request = DETECT_REQ_NONE;
+static volatile char s_detection_value = '\0';
+static volatile bool s_detection_available = false;
+static volatile char s_uart_single_char = '\0';
+static volatile bool s_uart_char_ready = false;
+
+static float s_part1_cm = 0.0f;
+static float s_part2_cm = 0.0f;
+static float s_obstacle2_width_cm = 0.0f;
+static char s_phaseA_detection = 'L';
+static char s_phaseC_detection = 'L';
+static bool s_phaseD_run1_zeroed = false;
+static bool s_phaseD_run2_zeroed = false;
+static bool s_phaseE_final_run_started = false;
+
+static float GetDistanceTravelled(void)
+{
+  SharedSensorData_t sd;
+  if (SharedData_GetSensorData(&sd)) {
+    return sd.distance_traveled_cm;
+  }
+  return 0.0f;
+}
+
+static inline float clamp_nonnegative(float value)
+{
+  return (value >= 0.0f) ? value : 0.0f;
+}
+
+// External UART handle
+extern UART_HandleTypeDef huart3;
+extern I2C_HandleTypeDef hi2c2;
+/* USER CODE END Variables */
+
+/* Private function prototypes -----------------------------------------------*/
+/* USER CODE BEGIN FunctionPrototypes */
+void CommunicationTask(void *argument);
+void ControlTask(void *argument);
+void MotorTask(void *argument);
+void OLEDTask(void *argument);
+void IMUTask(void *argument);
+void EncoderTask(void *argument);
+void IMUTimerCallback(void *argument);
+void EncoderTimerCallback(void *argument);
+void UltrasonicTimerCallback(void *argument);
+void IRTimerCallback(void *argument);
+
+void ProcessRobotCommand(RobotCommand_t* cmd);
+void SendACK(const char* message);
+
+void StartSensorTimers(void);
+void HandleEmergencyStop(void);
+
+void MX_FREERTOS_Init(void); /* (MISRA C 2004 rule 8.1) */
+
+/**
+  * @brief  FreeRTOS initialization
+  * @param  None
+  * @retval None
+  */
+void MX_FREERTOS_Init(void) {
+  /* USER CODE BEGIN Init */
+
+  /* USER CODE END Init */
+
+  /* USER CODE BEGIN RTOS_MUTEX */
+  /* add mutexes, ... */
+  /* USER CODE END RTOS_MUTEX */
+
+  /* USER CODE BEGIN RTOS_SEMAPHORES */
+  /* add semaphores, ... */
+  xIMUSem = osSemaphoreNew(1U, 0U, NULL);
+  xEncoderSem = osSemaphoreNew(1U, 0U, NULL);
+  /* USER CODE END RTOS_SEMAPHORES */
+
+  /* USER CODE BEGIN RTOS_TIMERS */
+  /* Create software timers */
+  xUltrasonicTimer = osTimerNew(UltrasonicTimerCallback, osTimerPeriodic, NULL, NULL);
+  xEncoderTimer = osTimerNew(EncoderTimerCallback, osTimerPeriodic, NULL, NULL);
+  xIMUTimer = osTimerNew(IMUTimerCallback, osTimerPeriodic, NULL, NULL);
+  xIRTimer = osTimerNew(IRTimerCallback, osTimerPeriodic, NULL, NULL);
+  /* USER CODE END RTOS_TIMERS */
+
+  /* USER CODE BEGIN RTOS_QUEUES */
+  /* Create queues */
+  xCommandQueue = osMessageQueueNew(COMMAND_QUEUE_SIZE, sizeof(RobotCommand_t), NULL);
+  xMotorQueue = osMessageQueueNew(MOTOR_QUEUE_SIZE, sizeof(MotorCommand_t), NULL);
+  /* USER CODE END RTOS_QUEUES */
+
+  /* Create the thread(s) */
+  /* USER CODE BEGIN RTOS_THREADS */
+  const osThreadAttr_t CommunicationTask_attributes = {
+    .name = "CommunicationTask",
+    .stack_size = COMMUNICATION_TASK_STACK_SIZE * 4,
+    .priority = COMMUNICATION_TASK_PRIORITY,
+  };
+  CommunicationTaskHandle = osThreadNew(CommunicationTask, NULL, &CommunicationTask_attributes);
+
+  const osThreadAttr_t OLEDTask_attributes = {
+      .name = "OLEDTask",
+      .stack_size = OLED_TASK_STACK_SIZE * 4,
+      .priority = OLED_TASK_PRIORITY,
+    };
+  //OLEDTaskHandle = osThreadNew(OLEDTask, NULL, &OLEDTask_attributes);
+
+  const osThreadAttr_t ControlTask_attributes = {
+    .name = "ControlTask",
+    .stack_size = CONTROL_TASK_STACK_SIZE * 4,
+    .priority = CONTROL_TASK_PRIORITY,
+  };
+  ControlTaskHandle = osThreadNew(ControlTask, NULL, &ControlTask_attributes);
+
+  const osThreadAttr_t MotorTask_attributes = {
+    .name = "MotorTask",
+    .stack_size = MOTOR_TASK_STACK_SIZE * 4,
+    .priority = MOTOR_TASK_PRIORITY,
+  };
+  MotorTaskHandle = osThreadNew(MotorTask, NULL, &MotorTask_attributes);
+
+  const osThreadAttr_t IMUTask_attributes = {
+    .name = "IMUTask",
+    .stack_size = SENSOR_TASK_STACK_SIZE * 4,
+    .priority = SENSOR_TASK_PRIORITY,
+  };
+  IMUTaskHandle = osThreadNew(IMUTask, NULL, &IMUTask_attributes);
+
+  const osThreadAttr_t EncoderTask_attributes = {
+    .name = "EncoderTask",
+    .stack_size = SENSOR_TASK_STACK_SIZE * 4,
+    .priority = SENSOR_TASK_PRIORITY,
+  };
+  EncoderTaskHandle = osThreadNew(EncoderTask, NULL, &EncoderTask_attributes);
+
+  /* USER CODE END RTOS_THREADS */
+
+  /* USER CODE BEGIN RTOS_EVENTS */
+  /* add events, ... */
+  /* USER CODE END RTOS_EVENTS */
+
+}
+
+/* USER CODE BEGIN Header_CommunicationTask */
+/**
+* @brief Function implementing the CommunicationTask thread.
+* @param argument: Not used
+* @retval None
+*/
+static inline float wrap360(float a){ while(a>=360.0f)a-=360.0f; while(a<0.0f)a+=360.0f; return a; }
+static inline float wrap180(float e){ while(e>180.0f)e-=360.0f; while(e<-180.0f)e+=360.0f; return e; }
+
+/* --- Put these near your other helpers (above the switch) --- */
+#define STEP_START_TURN(fn_call)                                      \
+  do {                                                                 \
+    if (!g_motion_goal.active) {                                       \
+      /* FIRST: if the last turn completed, advance the script */      \
+      if (g_motion_goal.completed) {                                   \
+        g_motion_goal.completed = 0;                                   \
+        s_step++;                                                      \
+      }                                                                \
+      /* ELSE: if we never started this step, start it now */          \
+      else if (!g_motion_goal.started) {                               \
+        g_motion_goal.completed = 0;                                   \
+        fn_call;                                                       \
+      }                                                                \
+    }                                                                  \
+  } while (0)
+
+#define STEP_START_FWD(cm_val) STEP_START_TURN(Goal_StartForward((cm_val)))
+#define STEP_START_BACK(cm_val) STEP_START_TURN(Goal_StartBackward((cm_val)))
+#define STEP_TURN_L45()         STEP_START_TURN(Goal_TurnLeft45())
+#define STEP_TURN_R45()         STEP_START_TURN(Goal_TurnRight45())
+#define STEP_TURN_L90()         STEP_START_TURN(Goal_TurnLeft90())
+#define STEP_TURN_R90()         STEP_START_TURN(Goal_TurnRight90())
+
+int i1 = 0;
+int i2 = 0;
+
+
+typedef enum {
+  PH_A = 0,
+  PH_B_L, PH_B_R,
+  PH_C,
+  PH_D_L, PH_D_R,
+  PH_E,
+  PH_F,
+  PH_G_L, PH_G_R,
+  PH_H,
+  PH_Z
+} Phase_t;
+
+static Phase_t s_phase   = PH_A;  // start state
+static uint8_t s_started = 0;
+static uint8_t s_step    = 0;
+
+/* Handy transition helper */
+#define PHASE_GOTO(NEXT) do { s_phase=(NEXT); s_started=0; s_step=0; } while(0)
+
+/* ===== IR-based straight-stop helpers ===================================== */
+
+typedef enum { IR_LEFT, IR_RIGHT, IR_EITHER, IR_BOTH } IRWhich_t;
+//static inline bool IRStop_Forward_UntilValid(IRWhich_t which);
+static inline bool IRStop_Forward_UntilInvalid_Left(void);
+static inline bool IRStop_Forward_UntilInvalid_Right(void);
+static inline bool IRStop_Forward_UntilValid(IRWhich_t which, float min_cm, float max_cm);
+static inline bool IRStop_Forward_UntilValid_Left(float min_cm, float max_cm);
+static inline bool IRStop_Forward_UntilValid_Right(float min_cm, float max_cm);
+static inline bool IRStop_Backward_UntilValid_Left(float min_cm, float max_cm);
+static inline bool IRStop_Backward_UntilValid_Right(float min_cm, float max_cm);
+
+
+static inline bool ir_is_valid(float d_cm)   { return d_cm > 0.0f; }  // your IR returns <0 if invalid
+static inline bool ir_is_invalid(float d_cm) { return d_cm < 0.0f; }
+
+/* Fetch the current left/right IRs from SharedData; returns false if no frame yet. */
+//static bool IR_ReadShared(float* left_cm, float* right_cm)
+//{
+//  SharedSensorData_t sd;
+//  if (!SharedData_GetSensorData(&sd)) return false;
+//  if (left_cm)  *left_cm  = sd.left_distance_cm;
+//  if (right_cm) *right_cm = sd.right_distance_cm;
+//  return true;
+//}
+
+/* NEW: read IRs synchronously (fresh) and publish to SharedData */
+static inline bool IR_ReadFast(float* left_cm, float* right_cm)
+{
+  float l = IR1_GetDistanceCm();
+  float r = IR2_GetDistanceCm();
+  if (left_cm)  *left_cm  = l;
+  if (right_cm) *right_cm = r;
+  SharedData_UpdateIR(l, r);
+  return true;
+}
+
+/* Evaluate a boolean predicate (valid/invalid) for the selected sensor(s). */
+typedef bool (*IRPred_t)(float d_cm);
+
+static bool IR_SelectAndTest(IRWhich_t which, IRPred_t pred, float l, float r)
+{
+  switch (which) {
+    case IR_LEFT:   return pred(l);
+    case IR_RIGHT:  return pred(r);
+    case IR_EITHER: return pred(l) || pred(r);
+    case IR_BOTH:   return pred(l) && pred(r);
+    default:        return false;
+  }
+}
+
+/* ===== Goal utils ===== */
+static inline void Goal_Clear(void) {
+    g_motion_goal.active             = 0;
+    g_motion_goal.started            = 0;
+    g_motion_goal.completed          = 0;
+    g_motion_goal.ack_sent           = 0;
+    g_motion_goal.target_distance_cm = 0.0f;
+    g_motion_goal.target_angle_deg   = 0.0f;
+    g_motion_goal.turn_backward      = 0;
+    g_motion_goal.start_distance_cm  = 0.0f;
+    g_motion_goal.start_yaw_deg      = 0.0f;
+    g_motion_goal.start_left_ticks   = 0;
+    g_motion_goal.start_right_ticks  = 0;
+}
+
+static inline void Goal_StartForward(float cm) {
+    Goal_Clear();
+    current_robot_state              = ROBOT_STATE_MOVING_FORWARD;
+    g_motion_goal.target_distance_cm = (cm >= 0.0f) ? cm : -cm;  // positive = forward
+    g_motion_goal.active             = 1;
+}
+
+static inline void Goal_StartBackward(float cm) {
+    Goal_Clear();
+    current_robot_state              = ROBOT_STATE_MOVING_BACKWARD;
+    g_motion_goal.target_distance_cm = -((cm >= 0.0f) ? cm : -cm);  // negative = backward
+    g_motion_goal.active             = 1;
+}
+
+static inline void Goal_StartTurnDeg(float deg_signed /* +right, -left */) {
+    Goal_Clear();
+    g_motion_goal.target_angle_deg = deg_signed;
+    g_motion_goal.active           = 1;
+    float yaw_now = IMU_GetYawLatest();            // [0..360)
+	g_motion_goal.start_yaw_deg     = yaw_now;
+	g_motion_goal.target_abs_yaw_deg = wrap360(yaw_now + deg_signed);
+
+	g_motion_goal.snap_needed = 0;
+	g_motion_goal.snap_active = 0;
+    current_robot_state =
+        (deg_signed < 0.0f) ? ROBOT_STATE_TURNING_LEFT :
+        (deg_signed > 0.0f) ? ROBOT_STATE_TURNING_RIGHT :
+                              ROBOT_STATE_IDLE;
+}
+
+static inline void Goal_TurnLeft45(void)  { Goal_StartTurnDeg(-45.0f); }
+static inline void Goal_TurnRight45(void) { Goal_StartTurnDeg(+45.0f); }
+static inline void Goal_TurnLeft90(void)  { Goal_StartTurnDeg(-85.0f); }
+static inline void Goal_TurnRight90(void) { Goal_StartTurnDeg(+80.0f); }
+static inline void Goal_TurnLeft180(void) { Goal_StartTurnDeg(-180.0f); }
+static inline void Goal_TurnRight180(void){ Goal_StartTurnDeg(+180.0f); }
+
+static inline void Goal_AbortNow(void) {
+    Motors_Brake();
+    Motors_Stop();
+    Servo_Center();
+    Goal_Clear();
+    current_robot_state = ROBOT_STATE_IDLE;
+    command_in_progress = false;
+}
+
+static inline void Goal_BrakeAndAbort(void) {
+    Motors_Brake();
+    osDelay(60);
+    Motors_Stop();
+    Servo_Center();
+    Goal_Clear();
+    current_robot_state = ROBOT_STATE_IDLE;
+    command_in_progress = false;
+}
+
+/* ===== IR drive via the goal-runner (uses Robot_Move* for servo correction) ===== */
+static inline bool ir_in_range(float d_cm, float min_cm, float max_cm)
+{
+  if (d_cm < 0.0f) return false;        // invalid reading is never "in"
+  if (min_cm > max_cm) { float t=min_cm; min_cm=max_cm; max_cm=t; }
+  return (d_cm >= min_cm) && (d_cm <= max_cm);
+}
+
+static inline void IRDrive_Ensure(bool forward)
+{
+  /* If no active goal, arm a large-distance drive so ControlTask moves it each tick */
+  if (!g_motion_goal.active) {
+    if (forward) {
+      Goal_StartForward(10000.0f);
+    } else {
+      Goal_StartBackward(10000.0f);
+    }
+  } else {
+    /* If an angle goal sneaks in, clear it and re-arm distance drive */
+    if (fabsf(g_motion_goal.target_angle_deg) > 0.0f) {
+      Goal_Clear();
+      if (forward) Goal_StartForward(10000.0f);
+      else         Goal_StartBackward(10000.0f);
+    }
+  }
+}
+
+static inline void IRDrive_StopNow(void)
+{
+  Motors_Brake();
+  osDelay(200);
+  Motors_Stop();
+  Servo_Center();
+  Goal_Clear();
+  current_robot_state = ROBOT_STATE_IDLE;
+}
+
+/* Shared finish routine: brake → stop → center → mark goal completed. */
+static void IR_StopAndComplete(void)
+{
+  IRDrive_StopNow();  // ensure the goal-driven motion is halted
+  g_motion_goal.completed = 1;
+  //g_motion_goal.snap_needed = 1;  // ask for snap pass
+}
+
+/* Generic runner used by the helpers below.  (with arming + failsafe) */
+static bool IRStraightCore(bool forward,
+                           IRWhich_t which,
+                           IRPred_t stop_when /* valid/invalid */,
+                           float min_cm, float max_cm,
+                           bool use_band_for_valid)
+{
+  const uint16_t PWM_L = 2750U, PWM_R = 2750U;   // (PWM via goal-runner)
+  const uint8_t  HIT_COUNT = 2;                // consecutive frames to confirm
+  const uint8_t  ARM_TICKS = 4;                // ~40ms at 10ms loop before allowing stop (faster)
+  const uint16_t FAILSAFE_TICKS = 300;         // ~3s max in this step
+
+  static uint8_t  hits_fwd_invalid = 0, hits_fwd_valid = 0;
+  static uint8_t  hits_back_invalid = 0, hits_back_valid = 0;
+
+  static uint8_t  arm_fwd_invalid = 0, arm_fwd_valid = 0;
+  static uint8_t  arm_back_invalid = 0, arm_back_valid = 0;
+
+  static uint16_t fs_fwd_invalid = 0, fs_fwd_valid = 0;
+  static uint16_t fs_back_invalid = 0, fs_back_valid = 0;
+
+  uint8_t  *hits_ptr, *arm_ptr;
+  uint16_t *fs_ptr;
+
+  if (forward) {
+    if (stop_when == ir_is_invalid) { hits_ptr=&hits_fwd_invalid; arm_ptr=&arm_fwd_invalid; fs_ptr=&fs_fwd_invalid; }
+    else                             { hits_ptr=&hits_fwd_valid;   arm_ptr=&arm_fwd_valid;   fs_ptr=&fs_fwd_valid;   }
+  } else {
+    if (stop_when == ir_is_invalid) { hits_ptr=&hits_back_invalid; arm_ptr=&arm_back_invalid; fs_ptr=&fs_back_invalid; }
+    else                             { hits_ptr=&hits_back_valid;   arm_ptr=&arm_back_valid;   fs_ptr=&fs_back_valid;   }
+  }
+
+  float L = -1.0f, R = -1.0f;
+
+  /* Ensure the ControlTask is actually driving using your goal-based path */
+  IRDrive_Ensure(forward);
+
+  /* Read sensors NOW (don’t wait for timer frame) */
+  if (!IR_ReadFast(&L, &R)) {
+    if (*arm_ptr < ARM_TICKS) (*arm_ptr)++;
+    if (*fs_ptr  < FAILSAFE_TICKS) (*fs_ptr)++;
+    return false;
+  }
+
+  /* Arming window: move first before we allow stopping */
+  if (*arm_ptr < ARM_TICKS) {
+    (*arm_ptr)++;
+    *hits_ptr = 0;
+    if (*fs_ptr  < FAILSAFE_TICKS) (*fs_ptr)++;
+    return false;
+  }
+
+  /* Stop predicate */
+  bool pass = false;
+
+  if (stop_when == ir_is_valid && use_band_for_valid) {
+    // Only the "valid" case uses the band; "invalid" behavior is unchanged
+    bool Lpass = ir_in_range(L, min_cm, max_cm);
+    bool Rpass = ir_in_range(R, min_cm, max_cm);
+    switch (which) {
+      case IR_LEFT:   pass = Lpass;           break;
+      case IR_RIGHT:  pass = Rpass;           break;
+      case IR_EITHER: pass = Lpass || Rpass;  break;
+      case IR_BOTH:   pass = Lpass && Rpass;  break;
+      default:        pass = false;           break;
+    }
+  } else {
+    // Original behavior (valid = >0, invalid = <0)
+    pass = IR_SelectAndTest(which, stop_when, L, R);
+  }
+
+  if (pass) {
+    if (++(*hits_ptr) >= HIT_COUNT) {
+      IR_StopAndComplete();
+      *hits_ptr = 0; *arm_ptr = 0; *fs_ptr = 0;
+      return true;
+    }
+  } else {
+    *hits_ptr = 0;
+  }
+
+
+  /* Failsafe so we don't hang forever */
+  if (++(*fs_ptr) >= FAILSAFE_TICKS) {
+    IRDrive_StopNow();
+    *hits_ptr = 0; *arm_ptr = 0; *fs_ptr = 0;
+    return true;  // treat as completed so the script advances
+  }
+
+  (void)PWM_L; (void)PWM_R; // kept for clarity; actual PWM used in your runner
+  return false;
+}
+
+/* ===== Public helpers ===== */
+/* ===== Public helpers ===== */
+
+/* VALID helpers now take a (min,max) band */
+static inline bool IRStop_Forward_UntilValid(IRWhich_t which, float min_cm, float max_cm)
+{ return IRStraightCore(true,  which,   ir_is_valid,   min_cm, max_cm, true); }
+
+static inline bool IRStop_Forward_UntilValid_Left(float min_cm, float max_cm)
+{ return IRStraightCore(true,  IR_LEFT,  ir_is_valid,  min_cm, max_cm, true); }
+
+static inline bool IRStop_Forward_UntilValid_Right(float min_cm, float max_cm)
+{ return IRStraightCore(true,  IR_RIGHT, ir_is_valid,  min_cm, max_cm, true); }
+
+static inline bool IRStop_Backward_UntilValid_Left(float min_cm, float max_cm)
+{ return IRStraightCore(false, IR_LEFT,  ir_is_valid,  min_cm, max_cm, true); }
+
+static inline bool IRStop_Backward_UntilValid_Right(float min_cm, float max_cm)
+{ return IRStraightCore(false, IR_RIGHT, ir_is_valid,  min_cm, max_cm, true); }
+
+/* INVALID helpers unchanged in behavior (but call the new 6-arg core) */
+static inline bool IRStop_Forward_UntilInvalid(IRWhich_t which)
+{ return IRStraightCore(true,  which,    ir_is_invalid, 0.0f, 0.0f, false); }
+
+static inline bool IRStop_Forward_UntilInvalid_Left(void)
+{ return IRStraightCore(true,  IR_LEFT,  ir_is_invalid, 0.0f, 0.0f, false); }
+
+static inline bool IRStop_Forward_UntilInvalid_Right(void)
+{ return IRStraightCore(true,  IR_RIGHT, ir_is_invalid, 0.0f, 0.0f, false); }
+
+static inline bool IRStop_Backward_UntilInvalid_Left(void)
+{ return IRStraightCore(false, IR_LEFT,  ir_is_invalid, 0.0f, 0.0f, false); }
+
+static inline bool IRStop_Backward_UntilInvalid_Right(void)
+{ return IRStraightCore(false, IR_RIGHT, ir_is_invalid, 0.0f, 0.0f, false); }
+
+
+
+
+/* Simple "go straight then stop at X cm" */
+static bool UltrasonicStop_StraightSimple(float stop_cm)
+{
+  const uint16_t PWM_L = 2750U, PWM_R = 2750U;
+  const float    STOP_GUARD_CM = 5.0f;
+  const uint8_t  HIT_COUNT   = 2;
+  const uint16_t BRAKE_DWELL_MS = 1250U;
+
+  static uint8_t hits = 0;
+
+  SharedSensorData_t sd;
+  if (!SharedData_GetSensorData(&sd)) {
+    Robot_MoveStraight(10000.0f, PWM_L, PWM_R);
+    return false;
+  }
+
+  Robot_MoveStraight(10000.0f, PWM_L, PWM_R);
+
+  if (sd.front_distance_cm > 0.0f) {
+    if (sd.front_distance_cm <= (stop_cm + STOP_GUARD_CM)) {
+      if (++hits >= HIT_COUNT) {
+        Motors_Brake();
+        osDelay(BRAKE_DWELL_MS);
+        Motors_Stop();
+        Servo_Center();
+
+        g_motion_goal.active             = 0;
+        g_motion_goal.started            = 0;
+        g_motion_goal.completed          = 1;
+        g_motion_goal.target_distance_cm = 0.0f;
+        current_robot_state              = ROBOT_STATE_IDLE;
+
+        hits = 0;
+        return true;
+      }
+    } else {
+      hits = 0;
+    }
+  }
+
+  return false;
+}
+
+
+/* USER CODE END Header_CommunicationTask */
+void CommunicationTask(void *argument)
+{
+  /* USER CODE BEGIN CommunicationTask */
+  HAL_UART_Receive_IT(&huart3, &uart_rx_buffer[0], 1);
+
+  for(;;)
+  {
+    if (s_uart_char_ready) {
+      char single = s_uart_single_char;
+      s_uart_char_ready = false;
+
+      if (single == 's' || single == 'S') {
+        if (!s_script_mode_enabled) {
+          s_script_mode_enabled = true;
+          s_script_start_requested = true;
+          osMessageQueueReset(xCommandQueue);
+          SendACK("SCRIPT_START");
+        } else {
+          SendACK("SCRIPT_BUSY");
+        }
+      } else {
+        if (single == 'l' || single == 'L') single = 'L';
+        else if (single == 'r' || single == 'R') single = 'R';
+
+        if (single == 'L' || single == 'R') {
+          if (!s_script_mode_enabled) {
+            SendACK("WAIT_FOR_S");
+          } else if (s_detection_request != DETECT_REQ_NONE) {
+            s_detection_value = single;
+            s_detection_available = true;
+            SendACK("DETECTION_RX");
+          } else {
+            SendACK("DETECTION_IGNORED");
+          }
+        }
+      }
+    }
+
+    if (uart_rx_index >= 7) {
+      uart_cmd_buffer[7] = '\0';
+      uart_rx_index = 0;
+      memset(uart_cmd_buffer, 0, sizeof(uart_cmd_buffer));
+      if (s_script_mode_enabled) {
+        SendACK("SCRIPT_MODE_ONLY");
+      } else {
+        SendACK("WAIT_FOR_S");
+      }
+    }
+
+    osDelay(10);
+  }
+  /* USER CODE END CommunicationTask */
+}
+
+/* USER CODE BEGIN Header_ControlTask */
+/**
+* @brief Function implementing the ControlTask thread.
+* @param argument: Not used
+* @retval None
+*/
+/* USER CODE END Header_ControlTask */
+void ControlTask(void *argument)
+{
+  /* USER CODE BEGIN ControlTask */
+  RobotCommand_t received_command;
+  osStatus_t status;
+  static bool timers_started = false;
+  static bool script_active = false;
+  TickType_t last_wake_time = xTaskGetTickCount();
+  const TickType_t control_period_ticks = pdMS_TO_TICKS(10);
+
+  for(;;)
+  {
+
+    if (!timers_started) {
+      StartSensorTimers();
+      timers_started = true;
+    }
+
+    if (s_ultrasonic_sample_pending) {
+      s_ultrasonic_sample_pending = false;
+      SharedData_UpdateUltrasonic(Ultrasonic_ReadDistance());
+    }
+
+    if (SharedData_CheckEmergencyStop()) {
+      HandleEmergencyStop();
+    }
+
+    status = osMessageQueueGet(xCommandQueue, &received_command, NULL, 100);
+
+    /* === RUN CURRENT MOTION GOAL (always) === */
+    if (g_motion_goal.active) {
+        if (g_motion_goal.target_distance_cm > 0.0f) {
+            Robot_MoveStraight(g_motion_goal.target_distance_cm, 3100, 3000);
+        } else if (g_motion_goal.target_distance_cm < 0.0f) {
+            Robot_MoveBackward(fabsf(g_motion_goal.target_distance_cm), 3100, 3000);
+        } else if (fabsf(g_motion_goal.target_angle_deg) > 0.0f) {
+            Robot_TurnUpdate();
+        }
+    } else if (g_motion_goal.completed &&
+            g_motion_goal.snap_needed &&
+            !g_motion_goal.snap_active){
+			g_motion_goal.snap_active = 1;
+   }
+   /* Only ACK when no snap is pending or running */
+    else if (!script_active &&                       // <--- added guard
+             g_motion_goal.completed &&
+             !g_motion_goal.ack_sent &&
+             !g_motion_goal.snap_active &&
+             !g_motion_goal.snap_needed) {
+        g_motion_goal.ack_sent   = 1;
+        g_motion_goal.completed  = 0;
+        command_in_progress      = false;
+        SendACK("CMD_COMPLETE");
+    }
+
+    if (status == osOK) {
+      (void)received_command;  // legacy commands are ignored in scripted mode
+    }
+
+    vTaskDelayUntil(&last_wake_time, control_period_ticks);
+
+    if (!script_active) {
+      if (s_script_start_requested) {
+        s_script_start_requested = false;
+        script_active = true;
+        PHASE_GOTO(PH_A);
+        s_detection_request = DETECT_REQ_NONE;
+        s_detection_available = false;
+        s_detection_value = '\0';
+        s_phaseA_detection = 'L';
+        s_phaseC_detection = 'L';
+        s_part1_cm = 0.0f;
+        s_part2_cm = 0.0f;
+        s_obstacle2_width_cm = 0.0f;
+        s_phaseD_run1_zeroed = false;
+        s_phaseD_run2_zeroed = false;
+        s_phaseE_final_run_started = false;
+        SharedData_ResetDistance();
+      } else {
+        continue;
+      }
+    }
+
+    // ==== Snap-to-heading passive align (runs after turns) ======================
+
+    // ==== grid ====
+
+//    {
+//
+//          const float TOL_DEG = 0.5f;  // Match current tolerance
+//          const uint32_t SNAP_TIMEOUT_MS = 1200;  // Match current timeout
+//          const float SNAP_PWM = 4300.0f;  // High PWM for fast pivot (tune down if overshoot)
+//          const int SERVO_LEFT_CCR = 260;  // Servo CCR for left turn (from your example)
+//          const int SERVO_RIGHT_CCR = 105;  // Servo CCR for right turn
+//          static uint32_t snap_start_ms = 0;
+//
+//          if (g_motion_goal.snap_needed && !g_motion_goal.snap_active) {
+//            g_motion_goal.snap_active = 1;
+//            snap_start_ms = HAL_GetTick();  // Use HAL_GetTick for timeout
+//            Motors_Brake(); osDelay(60); Motors_Stop();  // Initial settle
+//          }
+//
+//          if (g_motion_goal.snap_active) {
+//            float yaw_now = IMU_GetYawLatest();  // Use wrapped yaw for consistency
+//            float error = wrap180(g_motion_goal.target_abs_yaw_deg - yaw_now);
+//
+//            if (fabsf(error) <= TOL_DEG || (HAL_GetTick() - snap_start_ms) >= SNAP_TIMEOUT_MS) {
+//              // Done or timed out
+//              Motors_Brake(); osDelay(60); Motors_Stop();
+//              Servo_Center();
+//              g_motion_goal.snap_active = 0;
+//              g_motion_goal.snap_needed = 0;
+//              if (g_motion_goal.completed && !g_motion_goal.ack_sent) {
+//                // Let existing ACK path handle it
+//              }
+//            } else {
+//              // Pivot in place to correct error
+//              if (error > 0) {
+//                // Turn right (positive error)
+//                __HAL_TIM_SET_COMPARE(&htim12, TIM_CHANNEL_1, SERVO_RIGHT_CCR);  // Assuming htim3 for servo
+//                Motors_ForwardCounts(0, SNAP_PWM);  // Right wheel forward, left stopped
+//                Motors_ReverseCounts(0, 0);  // Ensure left is stopped (adjust if needed)
+//              } else {
+//                // Turn left (negative error)
+//                __HAL_TIM_SET_COMPARE(&htim12, TIM_CHANNEL_1, SERVO_LEFT_CCR);
+//                Motors_ForwardCounts(SNAP_PWM, 0);  // Left wheel forward, right stopped
+//                Motors_ReverseCounts(0, 0);  // Ensure right is stopped
+//              }
+//
+//              // Blocking loop: Check error every 10ms until small or timeout
+//              TickType_t loop_start = xTaskGetTickCount();
+//              while (fabsf(wrap180(g_motion_goal.target_abs_yaw_deg - IMU_GetYawLatest())) > TOL_DEG &&
+//                     (HAL_GetTick() - snap_start_ms) < SNAP_TIMEOUT_MS) {
+//                osDelay(10);  // Small delay to poll IMU
+//              }
+//
+//              // Stop pivoting after loop
+//              Motors_Brake(); osDelay(30); Motors_Stop();
+//              Servo_Center();
+//            }
+//            continue;  // Skip script work this tick
+//          }
+//        }
+
+    // ==== Less strict version ====
+
+//    {
+//          const float   TOL_DEG   = 1.5f;   // INCREASED: Less strict (was 0.5f)
+//          const float   KP_STEER  = 0.5f;   // REDUCED: Less aggressive (was 0.8f)
+//          const int16_t SERVO_MAX = 15;     // REDUCED: Cap steer (was 20)
+//          const uint16_t CREEP_PWM_L = 3000, CREEP_PWM_R = 3000;  // REDUCED: Slower nudge (was 4000)
+//          static uint32_t snap_ms = 0;
+//          const uint32_t SNAP_TIMEOUT_MS = 800;  // REDUCED: Shorter timeout (was 1200)
+//          static uint8_t snap_iterations = 0;    // NEW: Limit iterations to 3
+//          const uint8_t MAX_ITERATIONS = 3;
+//
+//          if (g_motion_goal.snap_needed && !g_motion_goal.snap_active) {
+//            g_motion_goal.snap_active = 1;
+//            snap_ms = 0;
+//            snap_iterations = 0;
+//            // optional: small brake settle
+//            Motors_Brake(); osDelay(40);  // REDUCED: Shorter settle (was 60)
+//            Motors_Stop();
+//          }
+//
+//          if (g_motion_goal.snap_active) {
+//            float yaw   = IMU_GetYawLatest();
+//            float error = wrap180(g_motion_goal.target_abs_yaw_deg - yaw);
+//
+//            if (fabsf(error) <= TOL_DEG || snap_ms >= SNAP_TIMEOUT_MS || snap_iterations >= MAX_ITERATIONS) {
+//              // done (or timed out/iteration limit)
+//              Servo_Center();
+//              Motors_Brake(); osDelay(40); Motors_Stop();  // REDUCED: Shorter brake (was 60)
+//              g_motion_goal.snap_active = 0;
+//              g_motion_goal.snap_needed = 0;
+//              if (g_motion_goal.completed && !g_motion_goal.ack_sent) {
+//                // let your existing "completed→ACK" path handle it
+//              }
+//            } else {
+//              float steer = KP_STEER * error;
+//              if (steer >  SERVO_MAX) steer =  SERVO_MAX;
+//              if (steer < -SERVO_MAX) steer = -SERVO_MAX;
+//
+//              if      (steer >  6)  Servo_SlightRight();  // REDUCED: Threshold (was 8)
+//              else if (steer < -6)  Servo_SlightLeft();
+//              else                  Servo_Center();
+//              Motors_ForwardCounts(CREEP_PWM_L, CREEP_PWM_R);
+//              osDelay(50);  // REDUCED: Shorter nudge (was 70)
+//              Motors_Brake(); osDelay(20); Motors_Stop();  // REDUCED: Shorter brake (was 30)
+//              Servo_Center();
+//
+//              snap_ms += 70;  // UPDATED: Match new delays
+//              snap_iterations++;
+//            }
+//            continue;
+//          }
+//        }
+
+    // ==== PID - controlled version
+//    {
+//          const float   TOL_DEG   = 0.5f;
+//          const float   KP_STEER  = 0.8f;
+//          const float   KI_STEER  = 0.02f;  // NEW: Integral gain for accumulated error
+//          const int16_t SERVO_MAX = 20;
+//          const uint16_t CREEP_PWM_L = 4000, CREEP_PWM_R = 4000;
+//          static uint32_t snap_ms = 0;s
+//          const uint32_t SNAP_TIMEOUT_MS = 1200;
+//          static float integral_error = 0.0f;  // NEW: Accumulate error for integral
+//          static float prev_error = 0.0f;      // NEW: For derivative (optional)
+//
+//          if (g_motion_goal.snap_needed && !g_motion_goal.snap_active) {
+//            g_motion_goal.snap_active = 1;
+//            snap_ms = 0;
+//            integral_error = 0.0f;  // Reset integral
+//            prev_error = 0.0f;
+//            Motors_Brake(); osDelay(60); Motors_Stop();
+//          }
+//
+//          if (g_motion_goal.snap_active) {
+//            float yaw   = IMU_GetYawLatest();
+//            float error = wrap180(g_motion_goal.target_abs_yaw_deg - yaw);
+//
+//            // NEW: Update integral (clamp to prevent windup)
+//            integral_error += error * 0.1f;  // Scale by time step (~100ms)
+//            if (integral_error > 10.0f) integral_error = 10.0f;
+//            if (integral_error < -10.0f) integral_error = -10.0f;
+//
+//            if (fabsf(error) <= TOL_DEG || snap_ms >= SNAP_TIMEOUT_MS) {
+//              Servo_Center();
+//              Motors_Brake(); osDelay(60); Motors_Stop();
+//              g_motion_goal.snap_active = 0;
+//              g_motion_goal.snap_needed = 0;
+//              if (g_motion_goal.completed && !g_motion_goal.ack_sent) {
+//                // let your existing "completed→ACK" path handle it
+//              }
+//            } else {
+//              // NEW: PI control (P + I)
+//              float steer = KP_STEER * error + KI_STEER * integral_error;
+//              if (steer >  SERVO_MAX) steer =  SERVO_MAX;
+//              if (steer < -SERVO_MAX) steer = -SERVO_MAX;
+//
+//              if      (steer >  8)  Servo_SlightRight();
+//              else if (steer < -8)  Servo_SlightLeft();
+//              else                  Servo_Center();
+//              Motors_ForwardCounts(CREEP_PWM_L, CREEP_PWM_R);
+//              osDelay(70);
+//              Motors_Brake(); osDelay(30); Motors_Stop();
+//              Servo_Center();
+//
+//              snap_ms += 100;
+//              prev_error = error;  // Update for next iteration
+//            }
+//            continue;
+//          }
+//        }
+    // ==== end snap block ========================================================
+
+
+    /* === PHASE STATE MACHINE === */
+    switch (s_phase) {
+      case PH_A: {
+        switch (s_step) {
+          case 0:
+        	if(i1 < 1){
+        		SendACK("NEED_IMAGE");
+				if (s_detection_request == DETECT_REQ_NONE) {
+						s_detection_request = DETECT_REQ_PHASE_A;
+						s_detection_available = false;
+						s_detection_value = '\0';
+					  }
+				i1++;
+        	}
+
+        	if (!s_started) { s_started = 1; Goal_StartForward(10000.0f); }
+            if (UltrasonicStop_StraightSimple(30.0f)) {
+              Goal_BrakeAndAbort();
+              s_step = 1;
+//              SendACK("NEED_IMAGE");
+//              if (s_detection_request == DETECT_REQ_NONE) {
+//                s_detection_request = DETECT_REQ_PHASE_A;
+//                s_detection_available = false;
+//                s_detection_value = '\0';
+//              }
+            }
+            break;
+
+          case 1:
+            if (s_detection_available && s_detection_request == DETECT_REQ_PHASE_A) {
+              char det = s_detection_value;
+              s_detection_available = false;
+              s_detection_request = DETECT_REQ_NONE;
+              s_detection_value = '\0';
+
+              s_phaseA_detection = (det == 'R') ? 'R' : 'L';
+              s_part1_cm = clamp_nonnegative(GetDistanceTravelled() + OBSTACLE_STOP_OFFSET_CM);
+              SharedData_ResetDistance();
+              s_phaseD_run1_zeroed = false;
+              s_phaseD_run2_zeroed = false;
+
+              if (det == 'R') PHASE_GOTO(PH_B_R);
+              else            PHASE_GOTO(PH_B_L);
+            }
+            break;
+
+          default: break;
+        }
+      } break;
+
+      /* ===================== B_L ===================== */
+      case PH_B_L: {
+        /* Reset all motion state at phase entry to prevent carryover bugs */
+        static bool case2_entered = false;
+
+        if (!s_started) {
+          s_started = 1;
+          g_motion_goal.completed = 0;
+          g_motion_goal.snap_needed = 0;
+          g_motion_goal.snap_active = 0;
+          case2_entered = false;
+        }
+
+        switch (s_step) {
+          case 0: /* Turn LEFT 45 (first sweep) */
+            STEP_TURN_L45();
+            break;
+
+          case 1: /* Turn RIGHT 45 (second sweep) */
+            STEP_TURN_R45();
+            break;
+
+          case 2: /* Reverse until RIGHT IR becomes valid */
+            if (!case2_entered) {
+              case2_entered = true;
+              // Ensure clean state: stop any residual motion, clear goal flags
+              Motors_Stop();
+              Goal_Clear();
+              osDelay(100);  // Brief settle
+            }
+            if (IRStop_Backward_UntilValid_Right(IR_VALID_MIN_CM, IR_VALID_MAX_CM)) {
+              g_motion_goal.completed = 0;  // Clear completed flag to prevent step skip
+              case2_entered = false;  // Reset for next time
+              s_step++;
+            }
+            break;
+
+          case 3: /* Inch forward 5 cm */
+            STEP_START_FWD(PHASE_B_INCH_FORWARD_CM);
+            break;
+
+          case 4: /* Turn RIGHT 45 to bias away from wall */
+            STEP_TURN_R45();
+            break;
+
+          case 5: /* Turn LEFT 45 to re-center heading */
+            STEP_TURN_L45();
+            break;
+
+          case 6: /* Reverse 10 cm, then proceed to Phase C */
+            if (!g_motion_goal.active && g_motion_goal.completed) {
+              g_motion_goal.completed = 0;
+              SharedData_ResetDistance();
+//            SendACK("NEED_IMAGE");
+//			  if (s_detection_request == DETECT_REQ_NONE) {
+//				s_detection_request = DETECT_REQ_PHASE_C;
+//				s_detection_available = false;
+//				s_detection_value = '\0';
+//			  }
+              PHASE_GOTO(PH_C);
+              break;
+            }
+            STEP_START_BACK(PHASE_B_BACKUP_CM);
+            break;
+
+          default: break;
+        }
+      } break;
+
+      /* ===================== B_R ===================== */
+      case PH_B_R: {
+        /* Reset all motion state at phase entry to prevent carryover bugs */
+        static bool case2_entered = false;
+
+        if (!s_started) {
+          s_started = 1;
+          g_motion_goal.completed = 0;
+          g_motion_goal.snap_needed = 0;
+          g_motion_goal.snap_active = 0;
+          case2_entered = false;
+        }
+
+        switch (s_step) {
+          case 0: /* Turn RIGHT 45 (first sweep) */
+            STEP_TURN_R45();
+            break;
+
+          case 1: /* Turn LEFT 45 (second sweep) */
+            STEP_TURN_L45();
+            break;
+
+          case 2: /* Reverse until LEFT IR becomes valid */
+            if (!case2_entered) {
+              case2_entered = true;
+              // Ensure clean state: stop any residual motion, clear goal flags
+              Motors_Stop();
+              Goal_Clear();
+              osDelay(100);  // Brief settle
+            }
+            if (IRStop_Backward_UntilValid_Left(IR_VALID_MIN_CM, IR_VALID_MAX_CM)) {
+              g_motion_goal.completed = 0;  // Clear completed flag to prevent step skip
+              case2_entered = false;  // Reset for next time
+              s_step++;
+            }
+            break;
+
+          case 3: /* Inch forward 5 cm */
+            STEP_START_FWD(PHASE_B_INCH_FORWARD_CM);
+            break;
+
+          case 4: /* Turn LEFT 45 to bias away from wall */
+            STEP_TURN_L45();
+            break;
+
+          case 5: /* Turn RIGHT 45 to re-center heading */
+            STEP_TURN_R45();
+            break;
+
+          case 6: /* Reverse 10 cm, then proceed to Phase C */
+            if (!g_motion_goal.active && g_motion_goal.completed) {
+              g_motion_goal.completed = 0;
+              SharedData_ResetDistance();
+              PHASE_GOTO(PH_C);
+              break;
+            }
+//            SendACK("NEED_IMAGE");
+//			  if (s_detection_request == DETECT_REQ_NONE) {
+//				s_detection_request = DETECT_REQ_PHASE_C;
+//				s_detection_available = false;
+//				s_detection_value = '\0';
+//			  }
+            STEP_START_BACK(PHASE_B_BACKUP_CM);
+            break;
+
+          default: break;
+        }
+      } break;
+
+      /* ===================== C ===================== */
+      case PH_C: {
+        switch (s_step) {
+          case 0:
+		  if(i2 < 1){
+			SendACK("NEED_IMAGE");
+			if (s_detection_request == DETECT_REQ_NONE) {
+					s_detection_request = DETECT_REQ_PHASE_C;
+					s_detection_available = false;
+					s_detection_value = '\0';
+				  }
+			i2++;
+			}
+//            SendACK("NEED_IMAGE");
+//		    if (s_detection_request == DETECT_REQ_NONE) {
+//			  s_detection_request = DETECT_REQ_PHASE_C;
+//			  s_detection_available = false;
+//			  s_detection_value = '\0';
+//		    }
+            if (!s_started) {
+              s_started = 1;
+              SharedData_ResetDistance();
+              Goal_StartForward(10000.0f);
+            }
+            if (UltrasonicStop_StraightSimple(40.0f)) {
+              Goal_BrakeAndAbort();
+              s_step = 1;
+//              SendACK("NEED_IMAGE");
+//              if (s_detection_request == DETECT_REQ_NONE) {
+//                s_detection_request = DETECT_REQ_PHASE_C;
+//                s_detection_available = false;
+//                s_detection_value = '\0';
+//              }
+            }
+            break;
+
+          case 1:
+            if (s_detection_available && s_detection_request == DETECT_REQ_PHASE_C) {
+              char det = s_detection_value;
+              s_detection_available = false;
+              s_detection_request = DETECT_REQ_NONE;
+              s_detection_value = '\0';
+
+              s_phaseC_detection = (det == 'R') ? 'R' : 'L';
+              s_part2_cm = clamp_nonnegative(GetDistanceTravelled() + OBSTACLE_STOP_OFFSET_CM);
+              SharedData_ResetDistance();
+              s_phaseD_run1_zeroed = false;
+              s_phaseD_run2_zeroed = false;
+              s_phaseE_final_run_started = false;
+
+              if (det == 'R') PHASE_GOTO(PH_D_R);
+              else            PHASE_GOTO(PH_D_L);
+            }
+            break;
+
+          default: break;
+        }
+      } break;
+
+
+      /* ===================== D_L: second obstacle (det=L) ===================== */
+      case PH_D_L: {
+        /* Reset all motion state at phase entry to prevent carryover bugs */
+        static bool case0_logged = false;
+        static bool case1_entered = false;
+        static bool case2_logged = false;
+
+        if (!s_started) {
+          s_started = 1;
+          g_motion_goal.completed = 0;
+          g_motion_goal.snap_needed = 0;
+          g_motion_goal.snap_active = 0;
+          case0_logged = false;
+          case1_entered = false;
+          case2_logged = false;
+          SendACK("D_L:PHASE_START");
+        }
+
+        switch (s_step) {
+          case 0: /* Turn left 90 */
+            if (!case0_logged) {
+              case0_logged = true;
+              SendACK("D_L:CASE_0_TURN");
+            }
+            STEP_TURN_L90();
+            break;
+
+          case 1: /* Reverse until right IR valid */
+            if (!case1_entered) {
+              case1_entered = true;
+              // Ensure clean state: stop any residual motion, clear goal flags
+              Motors_Stop();
+              Goal_Clear();
+              osDelay(100);  // Brief settle
+              SendACK("D_L:CASE_1_START");
+            }
+            if (IRStop_Backward_UntilValid_Right(IR_VALID_MIN_CM, IR_VALID_MAX_CM)) {
+              s_phaseD_run1_zeroed = false;
+              g_motion_goal.completed = 0;  // Clear completed flag to prevent step skip
+              case1_entered = false;  // Reset for potential retry
+              s_step++;
+              SendACK("D_L:CASE_1_DONE");
+            }
+            break;
+
+          case 2: /* Inch forward */
+            if (!case2_logged) {
+              case2_logged = true;
+              SendACK("D_L:CASE_2_INCH_FWD");
+            }
+            //STEP_START_FWD(PHASE_D_INCH_FORWARD_CM);
+            s_step++;
+            break;
+
+          case 3: /* Forward until right IR loses obstacle */
+            if (!s_phaseD_run1_zeroed) {
+              SharedData_ResetDistance();
+              s_phaseD_run1_zeroed = true;
+            }
+            if (IRStop_Forward_UntilInvalid_Right()) {
+              s_phaseD_run1_zeroed = false;
+              g_motion_goal.completed = 0;  // Clear completed flag to prevent step skip
+              s_step++;
+            }
+            break;
+
+          case 4: /* First half of 180° (right 90) */
+            STEP_TURN_R90();
+            break;
+
+          case 5: /* After first 90, reverse to align right IR */
+            if (IRStop_Backward_UntilValid_Right(IR_VALID_MIN_CM, IR_VALID_MAX_CM)) {
+              g_motion_goal.completed = 0;
+              s_step++;
+              SendACK("D_L:ALIGN_IR_REVERSE");
+            }
+            break;
+
+          case 6: /* Forward until right IR loses */
+            if (IRStop_Forward_UntilInvalid_Right()) {
+              g_motion_goal.completed = 0;
+              //STEP_START_FWD(5.0f);
+              s_step++;
+              SendACK("D_L:ALIGN_IR_FORWARD");
+            }
+            break;
+
+          case 7:
+			  STEP_START_FWD(5.0f);
+			  break;
+
+          case 8: /* Second half of 180° (right 90) */
+            STEP_TURN_R90();
+            break;
+
+          case 9: /* Reverse until right IR Invalid on far side */
+            if (IRStop_Backward_UntilInvalid_Right()) {
+              s_phaseD_run2_zeroed = false;
+              g_motion_goal.completed = 0;  // Clear completed flag to prevent step skip
+              s_step++;
+            }
+            break;
+
+          case 10: /* Inch forward to stabilise */
+              STEP_START_FWD(PHASE_D_INCH_FORWARD_CM);
+        	  //s_step++;
+            break;
+
+          case 11: /* Forward until right IR loses obstacle; record width */
+            if (!s_phaseD_run2_zeroed) {
+              SharedData_ResetDistance();
+              s_phaseD_run2_zeroed = true;
+            }
+            if (IRStop_Forward_UntilInvalid_Right()) {
+              s_obstacle2_width_cm = clamp_nonnegative(GetDistanceTravelled());
+              s_phaseD_run2_zeroed = false;
+              g_motion_goal.completed = 0;  // Clear completed flag to prevent step skip
+              s_step++;
+            }
+            break;
+
+          case 12: /* Final right 90 to face corridor again */
+            if (!g_motion_goal.active && g_motion_goal.completed) {
+              g_motion_goal.completed = 0;
+              SharedData_ResetDistance();
+              PHASE_GOTO(PH_E);
+              break;
+            }
+            STEP_TURN_R90();
+            break;
+
+          default: break;
+        }
+      } break;
+
+      /* ===================== D_R: second obstacle (det=R) ===================== */
+      case PH_D_R: {
+        /* Reset all motion state at phase entry to prevent carryover bugs */
+        static bool case1_entered = false;
+
+        if (!s_started) {
+          s_started = 1;
+          g_motion_goal.completed = 0;
+          g_motion_goal.snap_needed = 0;
+          g_motion_goal.snap_active = 0;
+          case1_entered = false;
+        }
+
+        switch (s_step) {
+          case 0: /* Turn right 90 */
+            STEP_TURN_R90();
+            break;
+
+          case 1: /* Reverse until left IR valid */
+            if (!case1_entered) {
+              case1_entered = true;
+              // Ensure clean state: stop any residual motion, clear goal flags
+              Motors_Stop();
+              Goal_Clear();
+              osDelay(100);  // Brief settle
+              SendACK("D_R:CASE_1_START");
+            }
+            if (IRStop_Backward_UntilValid_Left(IR_VALID_MIN_CM, IR_VALID_MAX_CM)) {
+              s_phaseD_run1_zeroed = false;
+              g_motion_goal.completed = 0;  // Clear completed flag to prevent step skip
+              case1_entered = false;  // Reset for potential retry
+              s_step++;
+              SendACK("D_R:CASE_1_DONE");
+            }
+            break;
+
+          case 2: /* Inch forward */
+              //STEP_START_FWD(PHASE_D_INCH_FORWARD_CM);
+        	  s_step++;
+            break;
+
+          case 3: /* Forward until left IR loses obstacle */
+            if (!s_phaseD_run1_zeroed) {
+              SharedData_ResetDistance();
+              s_phaseD_run1_zeroed = true;
+            }
+            if (IRStop_Forward_UntilInvalid_Left()) {
+              s_phaseD_run1_zeroed = false;
+              g_motion_goal.completed = 0;  // Clear completed flag to prevent step skip
+              s_step++;
+            }
+            break;
+
+          case 4: /* First half 180° (left 90) */
+            STEP_TURN_L90();
+            break;
+
+          case 5: /* After first 90, reverse to align left IR */
+            if (IRStop_Backward_UntilValid_Left(IR_VALID_MIN_CM, IR_VALID_MAX_CM)) {
+              g_motion_goal.completed = 0;
+              s_step++;
+              SendACK("D_R:ALIGN_IR_REVERSE");
+            }
+            break;
+
+          case 6: /* Forward until left IR loses */
+            if (IRStop_Forward_UntilInvalid_Left()) {
+              g_motion_goal.completed = 0;
+              s_step++;
+              SendACK("D_R:ALIGN_IR_FORWARD");
+            }
+            break;
+
+          case 7:
+        	  STEP_START_FWD(19.0f);
+        	  break;
+
+          case 8: /* Second half 180° (left 90) */
+            STEP_TURN_L90();
+            break;
+
+          case 9: /* Reverse until left IR Invalid */
+            if (IRStop_Backward_UntilInvalid_Left()) {
+              s_phaseD_run2_zeroed = false;
+              g_motion_goal.completed = 0;  // Clear completed flag to prevent step skip
+              s_step++;
+            }
+            break;
+
+          case 10: /* Inch forward */
+            STEP_START_FWD(PHASE_D_INCH_FORWARD_CM);
+        	//s_step++;
+            break;
+
+          case 11: /* Forward until left IR loses obstacle; capture width */
+            if (!s_phaseD_run2_zeroed) {
+              SharedData_ResetDistance();
+              s_phaseD_run2_zeroed = true;
+            }
+            if (IRStop_Forward_UntilInvalid_Left()) {
+              s_obstacle2_width_cm = clamp_nonnegative(GetDistanceTravelled());
+              s_phaseD_run2_zeroed = false;
+              g_motion_goal.completed = 0;  // Clear completed flag to prevent step skip
+              s_step++;
+            }
+            break;
+
+          case 12: /* Final left 90 */
+            if (!g_motion_goal.active && g_motion_goal.completed) {
+              g_motion_goal.completed = 0;
+              SharedData_ResetDistance();
+              PHASE_GOTO(PH_E);
+              break;
+            }
+            STEP_TURN_L90();
+            break;
+
+          default: break;
+        }
+      } break;
+
+      /* ===================== E ===================== */
+            case PH_E: {
+              /* Reset all motion state at phase entry to prevent carryover bugs */
+              static bool sidestep_done = false;  // NEW: Flag for IR-based sidestep sub-steps
+
+              if (!s_started) {
+                s_started = 1;
+                g_motion_goal.completed = 0;
+                g_motion_goal.snap_needed = 0;
+                g_motion_goal.snap_active = 0;
+                s_phaseE_final_run_started = false;
+                sidestep_done = false;  // NEW: Reset flag
+              }
+
+              switch (s_step) {
+                case 0: { /* Go straight the recorded part2 distance */
+                  float target = clamp_nonnegative(s_part2_cm);
+                  if (target <= 0.0f) { s_step++; break; }
+                  if (s_phaseC_detection == 'L') STEP_START_FWD(target + 45.0f);
+                  else STEP_START_FWD(target + 70.0f);
+
+                } break;
+
+//                case 1: { /* Inch forward 20 cm */
+//                  STEP_START_FWD(PHASE_E_INCH_FORWARD_CM);
+//                } break;
+
+                case 1: /* First 90 (opposite of detection) */
+                  if (s_phaseC_detection == 'R') STEP_TURN_L90();
+                  else                           STEP_TURN_R90();
+                  break;
+
+                case 2: /* IR-based sidestep: forward until IR valid, then backward until invalid */
+                  if (!sidestep_done) {
+                    // Move forward until appropriate IR becomes valid
+                    bool ir_valid_reached = false;
+                    if (s_phaseC_detection == 'R') {
+                      ir_valid_reached = IRStop_Forward_UntilValid_Left(IR_VALID_MIN_CM, IR_VALID_MAX_CM);
+                    } else {
+                      ir_valid_reached = IRStop_Forward_UntilValid_Right(IR_VALID_MIN_CM, IR_VALID_MAX_CM);
+                    }
+                    if (ir_valid_reached) {
+                      sidestep_done = true;
+                      g_motion_goal.completed = 0;  // Reset for next sub-step
+                    }
+                  } else {
+                    // Inch backwards fixed amt
+                	  if (s_phaseC_detection == 'L') STEP_START_BACK(7.0f);
+                	  else STEP_START_BACK(7.0f);
+//                    bool ir_invalid_reached = false;
+//                    if (s_phaseC_detection == 'R') {
+//                      ir_invalid_reached = IRStop_Backward_UntilInvalid_Left();
+//                    } else {
+//                      ir_invalid_reached = IRStop_Backward_UntilInvalid_Right();
+//                    }
+//                    if (ir_invalid_reached) {
+//                      sidestep_done = false;
+//                      g_motion_goal.completed = 0;  // Reset
+//                      s_step++;  // Advance to case 4 (second 90° turn)
+//                    }
+                  }
+                  break;
+//                case 4:
+//                	if (s_phaseC_detection == 'R') STEP_START_BACK(10.0f);
+//				    else                           STEP_START_FWD(10.0f);
+//
+//                	break;
+
+                case 3: /* Second 90 to face corridor again */
+                  if (s_phaseC_detection == 'R') STEP_TURN_R90();
+                  else                           STEP_TURN_L90();
+                  break;
+
+                case 4: /* Final straight until ultrasonic stop */
+                  if (!s_phaseE_final_run_started) {
+                    s_phaseE_final_run_started = true;
+                    Goal_StartForward(10000.0f);
+                  }
+                  if (UltrasonicStop_StraightSimple(PHASE_E_FINAL_STOP_CM)) {
+                    s_phaseE_final_run_started = false;
+                    PHASE_GOTO(PH_Z);
+                  }
+                  break;
+
+                default: break;
+              }
+            } break;
+
+
+
+
+#if 0
+      /* Legacy phases retained for reference */
+      case PH_F:
+      case PH_G_L:
+      case PH_G_R:
+      case PH_H:
+        break;
+#endif
+
+      case PH_Z:
+      default:
+        script_active = false;
+        s_script_mode_enabled = false;
+        s_detection_request = DETECT_REQ_NONE;
+        s_detection_available = false;
+        s_detection_value = '\0';
+        s_phaseD_run1_zeroed = false;
+        s_phaseD_run2_zeroed = false;
+        s_phaseE_final_run_started = false;
+        SendACK("SCRIPT_DONE");
+        break;
+    }
+
+  }
+  /* USER CODE END ControlTask */
+}
+
+/* USER CODE BEGIN Header_MotorTask */
+/**
+* @brief Function implementing the MotorTask thread.
+* @param argument: Not used
+* @retval None
+*/
+/* USER CODE END Header_MotorTask */
+void MotorTask(void *argument)
+{
+  /* USER CODE BEGIN MotorTask */
+  MotorCommand_t motor_cmd;
+  osStatus_t status;
+
+  for(;;)
+  {
+    status = osMessageQueueGet(xMotorQueue, &motor_cmd, NULL, 100);
+    if (status == osOK) {
+      switch (motor_cmd.cmd_type) {
+        case MOTOR_CMD_STOP:
+          Motors_Stop();
+          break;
+
+        case MOTOR_CMD_FORWARD:
+          Motors_ForwardCounts(motor_cmd.left_pwm, motor_cmd.right_pwm);
+          if (motor_cmd.duration_ms > 0) {
+            osDelay(motor_cmd.duration_ms);
+            Motors_Brake();
+            Motors_Stop();
+          }
+          break;
+
+        case MOTOR_CMD_BACKWARD:
+          Motors_ReverseCounts(motor_cmd.left_pwm, motor_cmd.right_pwm);
+          if(motor_cmd.duration_ms > 0){
+        	  osDelay(motor_cmd.duration_ms);
+        	  Motors_Brake();
+        	  Motors_Stop();
+          }
+          break;
+
+        case MOTOR_CMD_BRAKE:
+          Motors_Brake();
+          break;
+
+        default:
+          Motors_Stop();
+          break;
+      }
+
+      if (motor_cmd.servo_angle > 0) {
+        // Servo_SetPosition(motor_cmd.servo_angle);
+      }
+    }
+
+    osDelay(10);
+  }
+  /* USER CODE END MotorTask */
+}
+
+void IMUTask(void *argument)
+{
+  (void)argument;
+
+  for(;;)
+  {
+    if (osSemaphoreAcquire(xIMUSem, osWaitForever) == osOK) {
+      IMU_Update(&hi2c2, 0, GYRO_FULL_SCALE_250DPS);
+      SharedData_UpdateIMU(IMU_GetYawLatest(), IMU_GetGyroZLatest());
+    }
+  }
+}
+
+void EncoderTask(void *argument)
+{
+	(void)argument;
+
+	unsigned int left_count = 0U;
+	unsigned int right_count = 0U;
+
+	for (;;)
+	{
+    if (osSemaphoreAcquire(xEncoderSem, osWaitForever) == osOK) {
+      left_count  = __HAL_TIM_GET_COUNTER(&encA.htim);
+      right_count = __HAL_TIM_GET_COUNTER(&encC.htim);
+
+      SharedData_UpdateEncoders((int32_t)left_count, (int32_t)right_count);
+    }
+	}
+}
+
+/* USER CODE BEGIN Header_OLEDTask */
+/**
+* @brief Function implementing the OLEDTask thread.
+* @param argument: Not used
+* @retval None
+*/
+/* USER CODE END Header_OLEDTask */
+void OLEDTask(void *argument)
+{
+  /* USER CODE BEGIN OLEDTask */
+  SharedSensorData_t sensor_data;
+  char display_buffer[32];
+  snprintf(display_buffer, sizeof(display_buffer), "TESTTTTTT");
+  OLED_ShowString(0, 0, (uint8_t*)display_buffer);
+  for(;;)
+  {
+    if (SharedData_GetSensorData(&sensor_data)) {
+      OLED_Clear();
+
+      snprintf(display_buffer, sizeof(display_buffer), "Det: %s", sensor_data.detection_code);
+      OLED_ShowString(0, 0, (uint8_t*)display_buffer);
+
+      char ir_line[32];
+      snprintf(ir_line, sizeof(ir_line), "IR L:%.1f R:%.1f",
+               sensor_data.left_distance_cm, sensor_data.right_distance_cm);
+      OLED_ShowString(10, 10, (uint8_t*)ir_line);
+
+      snprintf(display_buffer, sizeof(display_buffer), "Dist: %.1fcm", sensor_data.front_distance_cm);
+      OLED_ShowString(0, 32, (uint8_t*)display_buffer);
+
+      snprintf(display_buffer, sizeof(display_buffer), "Yaw: %.1fdeg", sensor_data.yaw_angle_deg);
+      OLED_ShowString(0, 48, (uint8_t*)display_buffer);
+
+      OLED_Refresh_Gram();
+    }
+
+    osDelay(OLED_UPDATE_PERIOD_MS);
+  }
+  /* USER CODE END OLEDTask */
+}
+
+/* USER CODE BEGIN Application */
+void UltrasonicTimerCallback(void *argument) {
+  (void)argument;
+  s_ultrasonic_sample_pending = true;
+}
+
+void EncoderTimerCallback(void *argument) {
+  (void)argument;
+
+  if (xEncoderSem != NULL) {
+    osSemaphoreRelease(xEncoderSem);
+  }
+}
+
+void IMUTimerCallback(void *argument) {
+  (void)argument;
+
+  if (xIMUSem != NULL) {
+    osSemaphoreRelease(xIMUSem);
+  }
+}
+
+void IRTimerCallback(void *argument) {
+  (void)argument;
+
+  float left_distance  = IR1_GetDistanceCm();
+  float right_distance = IR2_GetDistanceCm();
+
+  SharedData_UpdateIR(left_distance, right_distance);
+}
+
+/**
+ * @brief Process robot command from RPi
+ */
+void ProcessRobotCommand(RobotCommand_t* cmd) {
+  MotorCommand_t motor_cmd;
+
+  if (!cmd) return;
+
+  SharedData_UpdateDetection(cmd->detection_data);
+  memset(&motor_cmd, 0, sizeof(motor_cmd));
+
+  switch (cmd->cmd_type) {
+    case CMD_FORWARD:
+      current_robot_state = ROBOT_STATE_MOVING_FORWARD;
+      g_motion_goal.target_distance_cm = (float)cmd->units;
+      g_motion_goal.target_angle_deg = 0.0f;
+      g_motion_goal.active = 1;
+      g_motion_goal.started = 0;
+      g_motion_goal.completed = 0;
+      g_motion_goal.ack_sent = 0;
+      g_motion_goal.start_distance_cm = 0.0f;
+      g_motion_goal.start_yaw_deg = 0.0f;
+      g_motion_goal.start_left_ticks = 0;
+      g_motion_goal.start_right_ticks = 0;
+      command_in_progress = true;
+      break;
+
+    case CMD_BACKWARD:
+      current_robot_state = ROBOT_STATE_MOVING_BACKWARD;
+      g_motion_goal.target_distance_cm = -(float)cmd->units;
+      g_motion_goal.target_angle_deg   = 0.0f;
+      g_motion_goal.active = 1;
+      g_motion_goal.started = 0;
+      g_motion_goal.completed = 0;
+      g_motion_goal.ack_sent = 0;
+      g_motion_goal.start_distance_cm = 0.0f;
+      g_motion_goal.start_yaw_deg = 0.0f;
+      g_motion_goal.start_left_ticks = 0;
+      g_motion_goal.start_right_ticks = 0;
+      g_motion_goal.turn_backward = 0;
+      command_in_progress = true;
+      break;
+
+    case CMD_STOP:
+      current_robot_state = ROBOT_STATE_IDLE;
+      motor_cmd.cmd_type = MOTOR_CMD_STOP;
+      osMessageQueuePut(xMotorQueue, &motor_cmd, 0, 100);
+      g_motion_goal.active = 0;
+      g_motion_goal.started = 0;
+      g_motion_goal.completed = 0;
+      g_motion_goal.ack_sent = 0;
+      command_in_progress = false;
+      SendACK("CMD_COMPLETE");
+      break;
+
+    case CMD_FORWARD_INDEFINITE:
+      current_robot_state = ROBOT_STATE_MOVING_FORWARD;
+      motor_cmd.cmd_type = MOTOR_CMD_FORWARD;
+      motor_cmd.left_pwm = 3000;
+      motor_cmd.right_pwm = 3000;
+      motor_cmd.duration_ms = 0;
+      osMessageQueuePut(xMotorQueue, &motor_cmd, 0, 100);
+      g_motion_goal.active = 0;
+      g_motion_goal.started = 0;
+      g_motion_goal.completed = 0;
+      g_motion_goal.ack_sent = 0;
+      command_in_progress = false;
+      SendACK("CMD_COMPLETE");
+      break;
+
+    case CMD_BACKWARD_INDEFINITE:
+      current_robot_state = ROBOT_STATE_MOVING_BACKWARD;
+      motor_cmd.cmd_type = MOTOR_CMD_BACKWARD;
+      motor_cmd.left_pwm = 3000;
+      motor_cmd.right_pwm = 3000;
+      motor_cmd.duration_ms = 0;
+      osMessageQueuePut(xMotorQueue, &motor_cmd, 0, 100);
+      g_motion_goal.active = 0;
+      g_motion_goal.started = 0;
+      g_motion_goal.completed = 0;
+      g_motion_goal.ack_sent = 0;
+      command_in_progress = false;
+      SendACK("CMD_COMPLETE");
+      break;
+
+    case CMD_TURN_LEFT_45:
+      Car_Turn(-45.0f);
+      command_in_progress = true;
+      break;
+
+    case CMD_TURN_RIGHT_45:
+      Car_Turn(45.0f);
+      command_in_progress = true;
+      break;
+
+    case CMD_TURN_LEFT_90:
+      Car_Turn(-79.0f);
+      command_in_progress = true;
+      break;
+
+    case CMD_TURN_RIGHT_90:
+      Car_Turn(80.0f);
+      command_in_progress = true;
+      break;
+
+    case CMD_TURN_LEFT_180:
+      Car_Turn(-180.0f);
+      command_in_progress = true;
+      break;
+
+    case CMD_TURN_RIGHT_180:
+      Car_Turn(180.0f);
+      command_in_progress = true;
+      break;
+
+    case CMD_TURN_LEFT_90_BACK:
+      Car_Turn(-90.0f);
+      g_motion_goal.turn_backward = 1;
+      command_in_progress = true;
+      break;
+
+    case CMD_TURN_RIGHT_90_BACK:
+      Car_Turn(90.0f);
+      g_motion_goal.turn_backward = 1;
+      command_in_progress = true;
+      break;
+
+    default:
+      SendACK("INVALID_CMD");
+      break;
+  }
+}
+
+/**
+ * @brief Send ACK message back to RPi
+ */
+void SendACK(const char* message) {
+  char ack_buffer[32];
+
+  snprintf(ack_buffer, sizeof(ack_buffer), "ACK:%s\r\n", message);
+  HAL_UART_Transmit(&huart3, (uint8_t*)ack_buffer, strlen(ack_buffer), 100);
+}
+
+/**
+ * @brief Handle emergency stop condition
+ */
+void HandleEmergencyStop(void) {
+  MotorCommand_t emergency_cmd;
+
+  current_robot_state = ROBOT_STATE_EMERGENCY_STOP;
+
+  emergency_cmd.cmd_type = MOTOR_CMD_BRAKE;
+  osMessageQueuePut(xMotorQueue, &emergency_cmd, 0, 0);
+
+  SendACK("EMERGENCY_STOP");
+
+  SharedData_SetEmergencyStop(false);
+  current_robot_state = ROBOT_STATE_IDLE;
+  SendACK("EMERGENCY_CLEARED");
+}
+
+/**
+ * @brief UART receive complete callback
+ */
+void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart) {
+  if (huart == &huart3) {
+    char rx = (char)uart_rx_buffer[0];
+
+    if (rx == '\r' || rx == '\n') {
+      uart_rx_index = 0;
+      memset(uart_cmd_buffer, 0, sizeof(uart_cmd_buffer));
+    } else if (rx == 'S' || rx == 's' || rx == 'L' || rx == 'l' || rx == 'R' || rx == 'r') {
+      s_uart_single_char = rx;
+      s_uart_char_ready = true;
+      uart_rx_index = 0;
+      memset(uart_cmd_buffer, 0, sizeof(uart_cmd_buffer));
+    } else {
+      if (uart_rx_index < sizeof(uart_cmd_buffer)) {
+        uart_cmd_buffer[uart_rx_index] = (uint8_t)rx;
+        uart_rx_index++;
+      } else {
+        uart_rx_index = 0;
+        memset(uart_cmd_buffer, 0, sizeof(uart_cmd_buffer));
+      }
+    }
+
+    HAL_UART_Receive_IT(&huart3, &uart_rx_buffer[0], 1);
+  }
+}
+
+/**
+ * @brief Initialize and start all software timers
+ */
+void StartSensorTimers(void) {
+  osTimerStart(xUltrasonicTimer, ULTRASONIC_TIMER_PERIOD_MS);
+  osTimerStart(xEncoderTimer, ENCODER_TIMER_PERIOD_MS);
+  osTimerStart(xIMUTimer, IMU_TIMER_PERIOD_MS);
+  osTimerStart(xIRTimer, IR_TIMER_PERIOD_MS);
+  if (xEncoderSem != NULL) {
+    osSemaphoreRelease(xEncoderSem);
+  }
+  if (xIMUSem != NULL) {
+    osSemaphoreRelease(xIMUSem);
+  }
+}
+/* USER CODE END Application */

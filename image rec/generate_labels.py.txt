@@ -1,0 +1,43 @@
+import os
+from ultralytics import YOLO
+from PIL import Image
+
+# Load YOLOv8 detection model
+model = YOLO("best.pt")  # NOT yolov8n-seg.pt
+
+# Folders
+# image_folder = "custom_dataset/train/images_gray"
+image_folder = "mdp_images"
+label_folder = "custom_dataset/train/labels"
+os.makedirs(label_folder, exist_ok=True)
+
+for img_file in os.listdir(image_folder):
+    if img_file.endswith((".jpg", ".png", ".jpeg")):
+        img_path = os.path.join(image_folder, img_file)
+        results = model(img_path)
+
+        # print("RESULTS: ", results)
+
+        im = Image.open(img_path)
+        w, h = im.size
+
+        label_file = os.path.join(
+            label_folder, os.path.splitext(img_file)[0] + ".txt")
+        with open(label_file, "w") as f:
+            for result in results:
+                for box in result.boxes:
+                    print("BOX: ", box)
+                    cls_id = int(box.cls[0])
+                    # Normalized xywh directly from YOLO
+                    x_center, y_center, bw, bh = box.xywhn[0]
+                    f.write(
+                        f"{cls_id} {x_center:.6f} {y_center:.6f} {bw:.6f} {bh:.6f}\n")
+
+                    # label = model.names[cls_id]  # get class name
+                    # conf = float(box.conf[0])    # confidence score
+
+                    # print(f"Image: {img_file} → Label: {label}, "
+                    #       f"BBox (xywhn): {x_center:.3f}, {y_center:.3f}, {bw:.3f}, {bh:.3f}, "
+                    #       f"Conf: {conf:.2f}")
+
+        print(f"Saved {label_file}")

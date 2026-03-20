@@ -1,0 +1,73 @@
+#ifndef IR_SENSOR_H_
+#define IR_SENSOR_H_
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+#include <stdint.h>
+
+/**
+ * @file ir_sensor.h
+ * @brief IR distance sensor interface using an inverse fit d = A / (V - B).
+ *
+ * Exposes:
+ *  - Raw ADC helpers (filtered average of last N samples)
+ *  - Distance getters in cm (return <0 if invalid/out-of-range)
+ *  - Voltage->cm conversion helper using the A/(V-B) model
+ *  - Optional OLED print helper
+ *
+ * Notes:
+ *  - The filter length, ADC handles, and exact fit constants live in ir_sensor.c.
+ *  - g_irLeftDist / g_irRightDist are optional globals you may mirror to.
+ */
+
+/* ===== Optional calibration overrides =====
+ * If you want to tweak the inverse-fit constants without editing ir_sensor.c,
+ * define these *before* including this header. The .c will `#ifndef` guard them.
+ */
+#ifndef IR_VFIT_A_DEFAULT
+#define IR_VFIT_A_DEFAULT   21.714f   /* A in d = A / (V - B) */
+#endif
+#ifndef IR_VFIT_B_DEFAULT
+#define IR_VFIT_B_DEFAULT    0.1286f  /* B in d = A / (V - B) */
+#endif
+
+/* Rated range (used for clamping/validity in the .c) */
+#ifndef IR_CM_MIN
+#define IR_CM_MIN            10.0f
+#endif
+#ifndef IR_CM_MAX
+#define IR_CM_MAX            80.0f
+#endif
+
+/* -------- Public Globals (optional to use) -------- */
+extern volatile float g_irLeftDist;    /* Latest left IR distance (cm), or <0 if invalid */
+extern volatile float g_irRightDist;   /* Latest right IR distance (cm), or <0 if invalid */
+
+/* -------- Raw ADC helpers (return filtered ADC counts) -------- */
+uint16_t IR1_ReadRaw(void);
+uint16_t IR2_ReadRaw(void);
+
+/* -------- Voltage -> distance (cm). Returns <0 if invalid/out-of-range --------
+ * Uses the inverse-fit d = A / (V - B). Implementation is in ir_sensor.c
+ * and will use IR_VFIT_A_DEFAULT / IR_VFIT_B_DEFAULT unless you override them.
+ */
+float IR_VtoCm(float voltage);
+
+/* -------- Distance getters (cm). Return <0 if invalid/out-of-range -------- */
+float IR1_GetDistanceCm(void);
+float IR2_GetDistanceCm(void);
+
+/* -------- Convenience wrappers to match your freertos.c usage -------- */
+static inline float IR_ReadLeft(void)  { return IR1_GetDistanceCm(); }
+static inline float IR_ReadRight(void) { return IR2_GetDistanceCm(); }
+
+/* -------- OLED helper to print one IR reading at (x,y) -------- */
+void IR_Display(float distanceCm, uint16_t x, uint16_t y);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif /* IR_SENSOR_H_ */

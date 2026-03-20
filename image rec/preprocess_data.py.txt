@@ -1,0 +1,260 @@
+import os
+import shutil
+import yaml
+from tqdm import tqdm
+
+# ---------------------------
+# Original label mapping (can have gaps)
+# ---------------------------
+# labelDict = {
+#     'A': 20,
+#     'B': 21,
+#     'C': 22,
+#     'D': 23,
+#     'E': 24,
+#     'F': 25,
+#     'G': 26,
+#     'H': 27,
+#     'S': 28,
+#     'T': 29,
+#     'U': 30,
+#     'V': 31,
+#     'W': 32,
+#     'X': 33,
+#     'Y': 34,
+#     'Z': 35,
+#     'Up': 36,
+#     'Down': 37,
+#     'Right': 38,
+#     'Left': 39,
+#     'Stop': 40,
+#     'One': 11,
+#     'Two': 12,
+#     'Three': 13,
+#     'Four': 14,
+#     'Five': 15,
+#     'Six': 16,
+#     'Seven': 17,
+#     'Eight': 18,
+#     'Nine': 19,
+#     'Box': 1,
+#     'Bullseye': 2,
+#     'NULL': 3
+# }
+
+# datasetMappings = {
+#     'one': 'One', 
+#     'two': 'Two',
+#     'three': 'Three',
+#     'four': 'Four',
+#     'five': 'Five',
+#     'six': 'Six',
+#     'seven': 'Seven',
+#     'eight': 'Eight',
+#     'nine': 'Nine',
+#     'A' : 'A',
+#     'B' : 'B',
+#     'C' : 'C',
+#     'D' : 'D',
+#     'E' : 'E',
+#     'F' : 'F',
+#     'G' : 'G',
+#     'H' : 'H',
+#     'S' : 'S',
+#     'T' : 'T',
+#     'U' : 'U',
+#     'V' : 'V',
+#     'W' : 'W',
+#     'X' : 'X',
+#     'Y' : 'Y',
+#     'Z' : 'Z',
+#     'up': 'Up', 
+#     'down': 'Down', 
+#     'right': 'Right', 
+#     'left': 'Left', 
+#     'Bullseye': 'Bullseye',
+#     'circle': 'Stop',
+# }
+
+# Dataset-specific mapping to global labels
+# datasetMappings = {
+#     '11': 'One', 
+#     '12': 'Two',
+#     '13': 'Three',
+#     '14': 'Four',
+#     '15': 'Five',
+#     '16': 'Six',
+#     '17': 'Seven',
+#     '18': 'Eight',
+#     '19': 'Nine',
+#     '20' : 'A',
+#     '21' : 'B',
+#     '22' : 'C',
+#     '23' : 'D',
+#     '24' : 'E',
+#     '25' : 'F',
+#     '26' : 'G',
+#     '27' : 'H',
+#     '28' : 'S',
+#     '29' : 'T',
+#     '30' : 'U',
+#     '31' : 'V',
+#     '32' : 'W',
+#     '33' : 'X',
+#     '34' : 'Y',
+#     '35' : 'Z',
+#     '36': 'Up', 
+#     '37': 'Down', 
+#     '38': 'Right', 
+#     '39': 'Left', 
+#     'marker': 'Bullseye',
+#     '40': 'Stop',
+# }
+
+labelDict = {
+    'A': 0,
+    'B': 1,
+    'Box': 2,
+    'Bullseye': 3,
+    'C': 4,
+    'D': 5,
+    'Down': 6,
+    'E': 7,
+    'Eight': 8,
+    'F': 9,
+    'Five': 10,
+    'Four': 11,
+    'G': 12,
+    'H': 13,
+    'Right': 14,
+    'NULL': 15,
+    'Nine': 16,
+    'One': 17,
+    'Left': 18,
+    'S': 19,
+    'Seven': 20,
+    'Six': 21,
+    'Stop': 22,
+    'T': 23,
+    'Three': 24,
+    'Two': 25,
+    'U': 26,
+    'Up': 27,
+    'V': 28,
+    'W': 29,
+    'X': 30,
+    'Y': 31,
+    'Z': 32,
+}
+
+# Dataset-specific mapping to global labels
+datasetMappings = {
+    '38': 'Right', 
+    '39': 'Left', 
+    '99': 'Bullseye'
+}
+
+# Output folder
+destParent = "task2_images"
+
+# ---------------------------
+# Remap original labels to consecutive IDs
+# ---------------------------
+# consecutive_labels = {label: idx for idx, label in enumerate(sorted(labelDict.keys()))}
+consecutive_labels = {label: idx for idx, label in enumerate(labelDict.keys())}
+
+print(consecutive_labels)
+
+# Create output folders
+for split in ['train', 'valid', 'test']:
+    os.makedirs(f"{destParent}/{split}/images", exist_ok=True)
+    os.makedirs(f"{destParent}/{split}/labels", exist_ok=True)
+
+# ---------------------------
+# Process dataset
+# ---------------------------
+def processDataset(parentFolder, datasetMappings, destParent):
+    # Load the dataset's YAML file
+    with open(f"{parentFolder}/data.yaml", "r") as stream:
+        yamlData = yaml.safe_load(stream)
+        nameClasses = yamlData['names']
+
+    for split in ['train', 'valid', 'test']:
+        annotationFolder = f"{parentFolder}/{split}/labels/"
+        imgFolder = f"{parentFolder}/{split}/images/"
+
+        if not os.path.exists(annotationFolder):
+            continue
+
+        annotationFilenames = os.listdir(annotationFolder)
+        for annotationFilename in tqdm(annotationFilenames, desc=f"Processing {parentFolder}/{split}"):
+            with open(os.path.join(annotationFolder, annotationFilename)) as f:
+                lines = f.readlines()
+                if len(lines) == 0:
+                    continue
+
+                newLines = []
+                for line in lines:
+                    parts = line.strip().split()
+                    label = nameClasses[int(parts[0])]
+
+                    # Map to global label if needed
+                    if label not in consecutive_labels:
+                        label = datasetMappings.get(label, None)
+                        if label is None:
+                            continue
+
+                    # Assign consecutive ID
+                    parts[0] = str(consecutive_labels[label])
+                    newLines.append(" ".join(parts))
+
+                if len(newLines) == 0:
+                    continue
+
+                # Write updated label file
+                new_label_path = f"{destParent}/{split}/labels/{parentFolder}_{annotationFilename}"
+                with open(new_label_path, 'w') as f:
+                    f.write("\n".join(newLines))
+
+                # Copy image
+                # src_img_path = os.path.join(imgFolder, annotationFilename.replace(".txt", ".jpg"))
+                # dst_img_path = f"{destParent}/{split}/images/{parentFolder}_{annotationFilename.replace('.txt', '.jpg')}"
+                # shutil.copy(src_img_path, dst_img_path)
+                img_name = annotationFilename.replace(".txt", "")
+                found = False
+                for ext in [".jpg", ".jpeg", ".png"]:
+                    src_img_path = os.path.join(imgFolder, img_name + ext)
+                    if os.path.exists(src_img_path):
+                        dst_img_path = f"{destParent}/{split}/images/{parentFolder}_{img_name}{ext}"
+                        shutil.copy(src_img_path, dst_img_path)
+                        found = True
+                        break
+
+                if not found:
+                    print(f"⚠️ Image not found for {annotationFilename} in {imgFolder}")
+
+# ---------------------------
+# Generate YOLO data.yaml
+# ---------------------------
+def generate_data_yaml(destParent, consecutive_labels):
+    names = [None]*len(consecutive_labels)
+    for label, idx in consecutive_labels.items():
+        names[idx] = label
+
+    data_yaml = {
+        'nc': len(consecutive_labels),
+        'train': f"{destParent}/train/images",
+        'val': f"{destParent}/valid/images",
+        'test': f"{destParent}/test/images",
+        'names': names
+    }
+
+    with open(os.path.join(destParent, "data.yaml"), 'w') as f:
+        yaml.dump(data_yaml, f, sort_keys=False)
+
+# ---------------------------
+# Example usage
+# ---------------------------
+parentFolder = 'task2_5'
+processDataset(parentFolder, datasetMappings, destParent)
+generate_data_yaml(destParent, consecutive_labels)

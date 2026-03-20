@@ -1,0 +1,20 @@
+import os
+from PIL import Image
+
+# Input and output folders
+# input_folder = r'custom_dataset/train/images'
+input_folder = r'mdp_images'
+output_folder = r'custom_dataset/train/images'
+os.makedirs(output_folder, exist_ok=True)
+
+# Loop through all image files
+for img_file in os.listdir(input_folder):
+    if img_file.lower().endswith(('.jpg', '.png', '.jpeg')):
+        img_path = os.path.join(input_folder, img_file)
+        img = Image.open(img_path).convert("L")  # Convert to grayscale
+
+        # Save grayscale image
+        save_path = os.path.join(output_folder, img_file)
+        img.save(save_path)
+
+        print(f"Saved grayscale image: {save_path}")

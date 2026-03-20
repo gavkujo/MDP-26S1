@@ -1,0 +1,87 @@
+/*
+ * car_turn.h
+ *
+ *  Created on: 18 Sep 2025
+ *      Author: Geraldine Tan
+ */
+
+#ifndef INC_CAR_TURN_H_
+#define INC_CAR_TURN_H_
+
+#include "main.h"
+#include <stdint.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+// ========= Straight-line motion =========
+
+/**
+ * @brief Move forward to a target distance (cm) with basic yaw hold.
+ *        Uses SharedSensorData for distance and yaw; brakes at the end.
+ *
+ * @param target_cm         Target distance to travel in cm.
+ * @param base_pwm_left     Base PWM for left wheel.
+ * @param base_pwm_right    Base PWM for right wheel.
+ */
+void Robot_MoveStraight(float target_cm,
+                        uint32_t base_pwm_left, uint32_t base_pwm_right);
+
+/**
+ * @brief Move backward to a target distance (cm) with inverted yaw hold.
+ *        Uses SharedSensorData for distance and yaw; brakes at the end.
+ *
+ * @param target_cm         Target distance to travel in cm (positive magnitude).
+ * @param base_pwm_left     Base PWM for left wheel (reverse).
+ * @param base_pwm_right    Base PWM for right wheel (reverse).
+ */
+void Robot_MoveBackward(float target_cm,
+                        uint32_t base_pwm_left, uint32_t base_pwm_right);
+
+// ========= In-place turn (goal setter) =========
+
+/**
+ * @brief Schedule an in-place turn by angleDeg.
+ *        Positive = right turn, negative = left turn.
+ *        ControlTask + Robot_TurnUpdate() perform the motion asynchronously.
+ *
+ * @param angleDeg Signed angle in degrees.
+ */
+void Car_Turn(float angleDeg);
+
+// ========= Non-blocking turn controller =========
+
+/**
+ * @brief Non-blocking in-place turn handler for any scheduled angle (±45°, ±90°, ±180°).
+ *        Uses current g_motion_goal settings and adapts PWM/tolerance windows
+ *        automatically based on the requested magnitude. Call periodically
+ *        from the control task while a turn goal is active.
+ */
+void Robot_TurnUpdate(void);
+
+// ========= Combined motion =========
+
+/**
+ * @brief Move forward (PID path in your app) then flow into a turn.
+ *        Currently delegates turning to Car_Turn(angleDeg).
+ *
+ * @param distance_cm       Distance to move before turning.
+ * @param target_speed      (reserved/unused here; provided for your PID path)
+ * @param Kp,Ki,Kd          (reserved/unused here; provided for your PID path)
+ * @param base_pwm_left     Base PWM for left wheel during forward move.
+ * @param base_pwm_right    Base PWM for right wheel during forward move.
+ * @param angleDeg          Signed angle for subsequent turn (deg).
+ */
+void Robot_MoveAndTurnContinuous(float distance_cm,
+                                 float target_speed,
+                                 float Kp, float Ki, float Kd,
+                                 uint32_t base_pwm_left,
+                                 uint32_t base_pwm_right,
+                                 float angleDeg);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif /* INC_CAR_TURN_H_ */

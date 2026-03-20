@@ -1,0 +1,169 @@
+/*
+ * shared_data.h
+ *
+ *  Created on: Sep 25, 2025
+ *      Author: MDP Team
+ */
+
+#ifndef INC_SHARED_DATA_H_
+#define INC_SHARED_DATA_H_
+
+#include <stdint.h>
+#include <stdbool.h>
+#include "cmsis_os.h"
+
+// Obstacle detection thresholds
+#define OBSTACLE_THRESHOLD_CM          20.0f
+#define IR_SIDE_THRESHOLD_CM           15.0f
+#define SENSOR_DATA_TIMEOUT_MS         500
+
+// Shared Sensor Data Structure
+typedef struct {
+    // Ultrasonic sensor data
+    float front_distance_cm;
+    bool obstacle_detected;
+    uint32_t ultrasonic_last_update_ms;
+    
+    // IR sensor data (stub for now)
+    float left_distance_cm;
+    float right_distance_cm;
+    bool left_wall_detected;
+    bool right_wall_detected;
+    uint32_t ir_last_update_ms;
+    
+    // Encoder data
+    int32_t left_encoder_ticks;
+    int32_t right_encoder_ticks;
+    int32_t left_encoder_delta;    // Change since last read
+    int32_t right_encoder_delta;   // Change since last read
+    float distance_traveled_cm;
+    float current_speed_left_cms;  // cm/s
+    float current_speed_right_cms; // cm/s
+    uint32_t encoder_last_update_ms;
+    
+    // IMU data
+    float yaw_angle_deg;
+    float gyro_z_dps;             // degrees per second
+    bool imu_ready;
+    bool imu_calibrated;
+    uint32_t imu_last_update_ms;
+
+    // Detection data from RPi
+    char detection_code[3];
+    uint32_t detection_last_update_ms;
+    
+    // System status
+    bool emergency_stop_active;
+    uint32_t system_time_ms;
+} SharedSensorData_t;
+
+// Motor Command Structure for Motor Task
+typedef enum {
+    MOTOR_CMD_STOP,
+    MOTOR_CMD_FORWARD,
+    MOTOR_CMD_BACKWARD,
+    MOTOR_CMD_TURN_LEFT,
+    MOTOR_CMD_TURN_RIGHT,
+    MOTOR_CMD_SET_SPEED,
+    MOTOR_CMD_BRAKE
+} MotorCommandType_t;
+
+typedef struct {
+    MotorCommandType_t cmd_type;
+    uint32_t left_pwm;           // PWM value for left motor
+    uint32_t right_pwm;          // PWM value for right motor
+    uint16_t servo_angle;        // Servo angle (100-230 range)
+    uint32_t duration_ms;        // Duration for timed commands (0 = indefinite)
+    bool use_pid;                // Whether to use PID control
+    float target_speed_cms;      // Target speed in cm/s for PID
+} MotorCommand_t;
+
+typedef struct {
+    float target_distance_cm;
+    float target_angle_deg;
+    uint8_t active;
+    uint8_t started;
+    uint8_t completed;
+    uint8_t ack_sent;
+    float start_distance_cm;
+    float start_yaw_deg;
+    int32_t start_left_ticks;
+    int32_t start_right_ticks;
+    uint8_t   turn_backward;
+} MotionGoal_t;
+
+extern MotionGoal_t g_motion_goal;
+
+
+
+
+// Global shared data instance
+extern SharedSensorData_t g_sensor_data;
+
+// Mutex for protecting shared sensor data
+extern osMutexId_t xSensorDataMutex;
+
+// Function Prototypes
+/**
+ * @brief Initialize shared sensor data structure
+ */
+void SharedData_Init(void);
+
+/**
+ * @brief Update ultrasonic sensor data (called from ultrasonic timer)
+ * @param distance_cm: Measured distance in cm
+ */
+void SharedData_UpdateUltrasonic(float distance_cm);
+
+/**
+ * @brief Update encoder data (called from encoder timer)
+ * @param left_ticks: Left encoder tick count
+ * @param right_ticks: Right encoder tick count
+ */
+void SharedData_UpdateEncoders(int32_t left_ticks, int32_t right_ticks);
+
+/**
+ * @brief Update IMU data (called from IMU timer)
+ * @param yaw_deg: Current yaw angle in degrees
+ * @param gyro_z: Z-axis gyroscope reading in dps
+ */
+void SharedData_UpdateIMU(float yaw_deg, float gyro_z);
+
+/**
+ * @brief Update IR sensor data (stub for now)
+ * @param left_distance: Left IR distance in cm
+ * @param right_distance: Right IR distance in cm
+ */
+void SharedData_UpdateIR(float left_distance, float right_distance);
+
+/**
+ * @brief Get a safe copy of sensor data
+ * @param data_copy: Output structure to copy data into
+ * @return true if data is fresh, false if timeout
+ */
+bool SharedData_GetSensorData(SharedSensorData_t* data_copy);
+
+/**
+ * @brief Check if emergency stop should be triggered
+ * @return true if emergency stop needed
+ */
+bool SharedData_CheckEmergencyStop(void);
+
+/**
+ * @brief Set emergency stop state
+ * @param active: true to activate emergency stop, false to clear
+ */
+void SharedData_SetEmergencyStop(bool active);
+
+/**
+ * @brief Check if sensor data is fresh (within timeout)
+ * @return true if all critical sensors are updating
+ */
+bool SharedData_IsDataFresh(void);
+
+/**
+ * @brief Store the latest detection digits received from RPi
+ */
+void SharedData_UpdateDetection(const char *detection_code);
+
+#endif /* INC_SHARED_DATA_H_ */
