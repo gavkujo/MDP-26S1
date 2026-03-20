@@ -7,7 +7,7 @@ Focus areas:
 ## 1) STM RTOS (Task 1 + Task 2)
 
 ### RTOS architecture intent
-I designed the STM side as a deterministic execution core for motion and safety-critical control.
+I designed the STM's RTOS side as a deterministic execution core for motion and safety-critical control.
 The main rule was: parsing and decision logic can be asynchronous, but motor actuation must remain predictable and bounded.
 
 ### Task decomposition (what each task owns)
